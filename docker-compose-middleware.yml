@@ -1,0 +1,175 @@
+# ==============================================================================
+#  mall 中间件一键启动 —— 全部 Docker 化，本地零安装
+# ------------------------------------------------------------------------------
+#  【放置位置】mall 项目根目录（与 mall-admin、mall-portal、document 同级）
+#     即：C:\work\mall\docker-compose-middleware.yml
+#     之所以要放在这里，是因为 mysql 服务挂载了 ./document/sql 用于首次自动建表
+#
+#  【日常命令】
+#     启动核心（MySQL + Redis）  docker compose -f docker-compose-middleware.yml up -d
+#     查看状态                  docker compose -f docker-compose-middleware.yml ps
+#     查看日志                  docker compose -f docker-compose-middleware.yml logs -f mysql
+#     停止（保留数据）           docker compose -f docker-compose-middleware.yml down
+#     停止并清空所有数据          docker compose -f docker-compose-middleware.yml down -v
+#
+#  【按需启动可选中间件】用 --profile 指定，不指定就只有 MySQL + Redis
+#     会员浏览记录(MongoDB)      --profile portal
+#     订单超时/延迟消息(MQ)       --profile mq
+#     商品搜索(Elasticsearch)     --profile search
+#     文件上传(MinIO)            --profile storage
+#     静态资源(Nginx)            --profile web
+#     一次全开                    --profile full
+#     例：docker compose -f docker-compose-middleware.yml --profile mq up -d
+#
+#  【端口说明】本机 3306 已被本地 MySQL 8.0 占用，所以容器映射到 3307
+#     对应 application-dev.yml 里要改：jdbc:mysql://localhost:3307/mall?...
+# ==============================================================================
+
+name: mall
+
+services:
+
+  # ============================ 核心 · 默认启动 ============================
+
+  mysql:
+    image: mysql:5.7                      # 与 mall 官方一致（脚本由 MySQL 5.7 导出）
+    container_name: mall-mysql
+    restart: unless-stopped
+    command:
+      - mysqld
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-time-zone=+08:00
+    environment:
+      MYSQL_ROOT_PASSWORD: root           # 与 application-dev.yml 的 password 对齐
+      MYSQL_DATABASE: mall                # 预建库 + 让初始化脚本默认作用于 mall 库
+      TZ: Asia/Shanghai
+    ports:
+      - "3307:3306"
+    volumes:
+      - mall-mysql-data:/var/lib/mysql
+      # 首次初始化数据卷为空时，自动执行这里的 mall.sql 建表
+      - ./document/sql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h127.0.0.1 -uroot -proot --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    networks:
+      - mall-net
+
+  redis:
+    image: redis:7                        # 与 mall 官方一致
+    container_name: mall-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    # 注意：不设密码。application-dev.yml 里 redis.password 为空，设了反而连不上
+    ports:
+      - "6379:6379"
+    volumes:
+      - mall-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    networks:
+      - mall-net
+
+  # ======================= 可选 · 需要时用 --profile 启动 =======================
+
+  # 会员浏览记录、商品收藏等用到的文档库
+  mongo:
+    image: mongo:4                        # 与 mall 官方一致
+    container_name: mall-mongo
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mall-mongo-data:/data/db
+    networks:
+      - mall-net
+    profiles: ["portal", "full"]
+
+  # 订单超时取消、延迟消息
+  rabbitmq:
+    image: rabbitmq:3.9.11-management
+    container_name: mall-rabbitmq
+    restart: unless-stopped
+    environment:
+      # 必须与 mall-portal/src/main/resources/application-dev.yml 保持一致
+      # 该配置用的是 mall/mall + virtual-host /mall，不是 guest/guest
+      RABBITMQ_DEFAULT_USER: mall
+      RABBITMQ_DEFAULT_PASS: mall
+      RABBITMQ_DEFAULT_VHOST: /mall
+    ports:
+      - "5672:5672"                       # AMQP 协议端口
+      - "15672:15672"                     # 管理界面 http://localhost:15672
+    volumes:
+      - mall-rabbitmq-data:/var/lib/rabbitmq
+    networks:
+      - mall-net
+    profiles: ["mq", "full"]
+
+  # 商品搜索（mall-search 模块）
+  # ⚠️ 内存占用较大：限定 512m~1G。同时开 IDEA 会吃紧，建议单独启动
+  elasticsearch:
+    image: elasticsearch:7.17.3
+    container_name: mall-es
+    restart: unless-stopped
+    environment:
+      cluster.name: mall-es
+      discovery.type: single-node
+      ES_JAVA_OPTS: "-Xms512m -Xmx1024m"
+      TZ: Asia/Shanghai
+    ports:
+      - "9200:9200"
+    volumes:
+      - mall-es-data:/usr/share/elasticsearch/data
+    networks:
+      - mall-net
+    profiles: ["search", "full"]
+
+  # 对象存储，商品图片上传用
+  # 注意：这里映射到 9000，与 application-dev.yml 的 minio.endpoint 一致
+  # （mall 官方 compose 写的是 9090，与配置文件对不上，这里做了修正）
+  minio:
+    image: minio/minio
+    container_name: mall-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"                       # API 端口
+      - "9001:9001"                       # 控制台 http://localhost:9001
+    volumes:
+      - mall-minio-data:/data
+    networks:
+      - mall-net
+    profiles: ["storage", "full"]
+
+  # 前端静态资源服务器（跑 mall-admin-web 打包产物时用）
+  nginx:
+    image: nginx:1.22
+    container_name: mall-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    networks:
+      - mall-net
+    profiles: ["web", "full"]
+
+volumes:
+  mall-mysql-data:
+  mall-redis-data:
+  mall-mongo-data:
+  mall-rabbitmq-data:
+  mall-es-data:
+  mall-minio-data:
+
+networks:
+  mall-net:
+    driver: bridge

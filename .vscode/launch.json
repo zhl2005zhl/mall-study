@@ -1,0 +1,25 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "java",
+      "name": "mall-portal (18087)",
+      "request": "launch",
+      "mainClass": "com.macro.mall.portal.MallPortalApplication",
+      "projectName": "mall-portal",
+      "args": "--server.port=18087",
+      "vmArgs": "-Dfile.encoding=UTF-8",
+      "console": "integratedTerminal"
+    },
+    {
+      "type": "java",
+      "name": "mall-admin (18086)",
+      "request": "launch",
+      "mainClass": "com.macro.mall.MallAdminApplication",
+      "projectName": "mall-admin",
+      "args": "--server.port=18086",
+      "vmArgs": "-Dfile.encoding=UTF-8",
+      "console": "integratedTerminal"
+    }
+  ]
+}

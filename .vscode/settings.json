@@ -1,0 +1,40 @@
+{
+  "java.jdt.ls.java.home": "C:\\Program Files\\Eclipse Adoptium\\jdk-17.0.18.8-hotspot",
+  "java.configuration.runtimes": [
+    {
+      "name": "JavaSE-17",
+      "path": "C:\\Program Files\\Eclipse Adoptium\\jdk-17.0.18.8-hotspot",
+      "default": true
+    }
+  ],
+  "java.configuration.maven.userSettings": "C:\\Users\\张鸿林\\.m2\\settings.xml",
+  "java.compile.nullAnalysis.mode": "disabled",
+  "java.project.resourceFilters": [
+    "node_modules",
+    ".git",
+    "target"
+  ],
+  "files.watcherExclude": {
+    "**/target/**": true
+  },
+  "files.encoding": "utf8",
+  "files.autoGuessEncoding": false,
+  "[java]": {
+    "editor.tabSize": 4,
+    "editor.insertSpaces": true,
+    "editor.detectIndentation": false
+  },
+  "[xml]": {
+    "editor.tabSize": 4
+  },
+  "[yaml]": {
+    "editor.tabSize": 2
+  },
+  "[properties]": {
+    "editor.tabSize": 2
+  },
+
+  "code-runner.executorMap": {
+    "java": "echo [mall] 这是 Spring Boot 项目，Code Runner 用 javac 单文件编译无法解析 Maven 依赖。请按 F5 启动（launch.json 已配好 mall-portal / mall-admin）。"
+  }
+}

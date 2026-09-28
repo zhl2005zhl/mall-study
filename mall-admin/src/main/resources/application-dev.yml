@@ -1,6 +1,11 @@
+# 注意：端口会被 Windows 保留，且保留段每次开机漂移（Hyper-V / WSL2 动态占用，通常落在 10000 以下）
+# 详见 netsh int ipv4 show excludedportrange protocol=tcp，故统一改用 10000 以上的高位段
+server:
+  port: 18086
+
 spring:
   datasource:
-    url: jdbc:mysql://localhost:3306/mall?useUnicode=true&characterEncoding=utf-8&serverTimezone=Asia/Shanghai&useSSL=false
+    url: jdbc:mysql://localhost:3307/mall?useUnicode=true&characterEncoding=utf-8&serverTimezone=Asia/Shanghai&useSSL=false
     username: root
     password: root
     druid:

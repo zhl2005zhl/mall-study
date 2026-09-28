@@ -1,9 +1,10 @@
+# 端口改用 10000 以上的高位段：Windows 保留段每次开机漂移（通常 < 10000），8687 已被保留过
 server:
-  port: 8085
+  port: 18087
 
 spring:
   datasource:
-    url: jdbc:mysql://localhost:3306/mall?useUnicode=true&characterEncoding=utf-8&serverTimezone=Asia/Shanghai&useSSL=false
+    url: jdbc:mysql://localhost:3307/mall?useUnicode=true&characterEncoding=utf-8&serverTimezone=Asia/Shanghai&useSSL=false
     username: root
     password: root
     druid:

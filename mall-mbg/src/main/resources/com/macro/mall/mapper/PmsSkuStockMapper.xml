@@ -303,4 +303,16 @@
       sp_data = #{spData,jdbcType=VARCHAR}
     where id = #{id,jdbcType=BIGINT}
   </update>
+
+  <!--
+    原子锁定库存（并发改造点）
+    条件与更新写在同一条 SQL 内，由数据库保证原子性；
+    调用方用 affected rows 判断是否锁定成功（0 = 库存不足）。
+  -->
+  <update id="lockSkuStock">
+    update pms_sku_stock
+    set lock_stock = lock_stock + #{quantity}
+    where id = #{skuId}
+      and stock - lock_stock &gt;= #{quantity}
+  </update>
 </mapper>

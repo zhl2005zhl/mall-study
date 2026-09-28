@@ -733,9 +733,16 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
      */
     private void lockStock(List<CartPromotionItem> cartPromotionItemList) {
         for (CartPromotionItem cartPromotionItem : cartPromotionItemList) {
-            PmsSkuStock skuStock = skuStockMapper.selectByPrimaryKey(cartPromotionItem.getProductSkuId());
-            skuStock.setLockStock(skuStock.getLockStock() + cartPromotionItem.getQuantity());
-            skuStockMapper.updateByPrimaryKeySelective(skuStock);
+            // 原子更新：在数据库层完成「库存够才锁定」，不再先查询再写回绝对值。
+            // 原实现（select -> 内存累加 -> update 绝对值）在并发下会丢失更新，
+            // 且检查与更新之间存在时间窗，可能导致超卖。
+            int affected = skuStockMapper.lockSkuStock(
+                    cartPromotionItem.getProductSkuId(),
+                    cartPromotionItem.getQuantity());
+            if (affected == 0) {
+                // 影响行数为 0，说明 stock - lock_stock < quantity，即库存不足
+                Asserts.fail("库存不足：" + cartPromotionItem.getProductName());
+            }
         }
     }
 

@@ -1,5 +1,15 @@
 # mall
 
+> **本项目基于 [macrozheng/mall](https://github.com/macrozheng/mall) 二次开发。**
+> 原作者：macrozheng（MIT 协议，允许修改与分发）。本仓库为个人学习复健用途。
+>
+> **我在原项目基础上的主要工作**（详见 [REFACTOR.md](REFACTOR.md)）：
+> - 定位并修复了**下单锁库存的并发丢失更新**缺陷 —— 压测发现 10 并发下单全部成功，
+>   但 `lock_stock` 只记 1（丢失 9 次），存在超卖风险
+> - 改造为**数据库层原子更新 + 条件校验**，并用真实 HTTP 并发压测验证：
+>   库存充足时锁定数精确等于成功订单数；库存仅 5 件时恰好 5 单成功、5 单被拦下，未发生超卖
+> - 附复现与验证脚本：`docs/lab/lockstock_verify.py`；完整证据链与笔记见 `docs/`
+
 <p>
   <a href="#公众号"><img src="http://macro-oss.oss-cn-shenzhen.aliyuncs.com/mall/badge/%E5%85%AC%E4%BC%97%E5%8F%B7-macrozheng-blue.svg" alt="公众号"></a>
   <a href="#公众号"><img src="http://macro-oss.oss-cn-shenzhen.aliyuncs.com/mall/badge/%E4%BA%A4%E6%B5%81-%E5%BE%AE%E4%BF%A1%E7%BE%A4-2BA245.svg" alt="交流"></a>

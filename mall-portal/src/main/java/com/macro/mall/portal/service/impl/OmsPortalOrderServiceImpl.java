@@ -9,6 +9,7 @@ import com.macro.mall.common.service.RedisService;
 import com.macro.mall.mapper.*;
 import com.macro.mall.model.*;
 import com.macro.mall.portal.component.CancelOrderSender;
+import com.macro.mall.portal.dao.FlashPromotionOrderDao;
 import com.macro.mall.portal.dao.PortalOrderDao;
 import com.macro.mall.portal.dao.PortalOrderItemDao;
 import com.macro.mall.portal.dao.SmsCouponHistoryDao;
@@ -69,6 +70,18 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
     private OmsOrderItemMapper orderItemMapper;
     @Autowired
     private CancelOrderSender cancelOrderSender;
+    /**
+     * 秒杀流水：取消订单时用它判断「这个订单是不是秒杀订单」。
+     * 用 Dao 而不是 Service 是为了只读流水状态、避免和 SeckillServiceImpl 形成双向依赖。
+     */
+    @Autowired
+    private FlashPromotionOrderDao flashPromotionOrderDao;
+    /**
+     * 秒杀服务：只用于「回滚秒杀库存」这一个动作。
+     * 注意 SeckillServiceImpl 并不依赖 OmsPortalOrderService，所以这里没有循环依赖。
+     */
+    @Autowired
+    private SeckillService seckillService;
 
     @Override
     public ConfirmOrderResult generateConfirmOrder(List<Long> cartIds) {
@@ -333,6 +346,8 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
                     portalOrderDao.releaseSkuStockLock(timeOutOrder.getOrderItemList()),
                     timeOutOrder.getOrderItemList(),
                     "超时关单 orderSn=" + timeOutOrder.getOrderSn());
+            // ★ 秒杀订单要一并回滚秒杀库存
+            rollbackSeckillIfNeeded(timeOutOrder.getId());
             //修改优惠券使用状态
             updateCouponStatus(timeOutOrder.getCouponId(), timeOutOrder.getMemberId(), null, 0);
             //返还使用积分
@@ -370,6 +385,8 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
                         orderItemList,
                         "手动取消订单 orderId=" + orderId);
             }
+            // ★ 如果是秒杀订单，还要把秒杀库存（Redis + DB）回滚，否则那件商品永远卖不出去
+            rollbackSeckillIfNeeded(orderId);
             //修改优惠券使用状态
             updateCouponStatus(cancelOrder.getCouponId(), cancelOrder.getMemberId(), null, 0);
             //返还使用积分
@@ -792,6 +809,37 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
             }
         }
         return null;
+    }
+
+    /**
+     * 如果是秒杀订单，回滚秒杀库存（Redis + DB）。
+     *
+     * 【幂等保证在哪】
+     * 在 markCancelled 的条件更新里：只有把流水状态从「已建单(1)」改成「已取消(3)」成功的
+     * 那一次调用才拿到回滚权，其余调用拿到 affected=0 直接返回。
+     * 这样即使用户点两次取消、或者超时关单与手动取消并发触发，
+     * 库存也只会被回滚一次 —— **回滚两次等于凭空多出库存，会造成超卖**。
+     *
+     * 这与「支付回调的幂等」是同一个套路：用状态迁移做幂等键，而不是靠加锁或标志位。
+     */
+    private void rollbackSeckillIfNeeded(Long orderId) {
+        FlashPromotionOrderRecord seckillRecord = flashPromotionOrderDao.selectByOrderId(orderId);
+        if (seckillRecord == null) {
+            return;   // 普通订单，不涉及秒杀库存
+        }
+        int affected = flashPromotionOrderDao.markCancelled(seckillRecord.getId());
+        if (affected == 0) {
+            LOGGER.info("秒杀库存已回滚过（重复取消或并发取消），跳过。orderId={} requestId={}",
+                    orderId, seckillRecord.getRequestId());
+            return;
+        }
+        int quantity = seckillRecord.getQuantity() == null ? 1 : seckillRecord.getQuantity();
+        seckillService.rollbackSeckillStock(
+                seckillRecord.getRelationId(), seckillRecord.getProductId(),
+                seckillRecord.getFlashPromotionId(), seckillRecord.getFlashPromotionSessionId(),
+                seckillRecord.getMemberId(), quantity);
+        LOGGER.info("秒杀订单已取消，库存已回滚。orderId={} requestId={} qty={}",
+                orderId, seckillRecord.getRequestId(), quantity);
     }
 
     /**

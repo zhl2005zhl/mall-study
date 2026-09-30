@@ -1,0 +1,110 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.macro.mall.portal.dao.FlashPromotionOrderDao">
+
+    <resultMap id="recordMap" type="com.macro.mall.portal.domain.FlashPromotionOrderRecord">
+        <id column="id" property="id"/>
+        <result column="request_id" property="requestId"/>
+        <result column="order_id" property="orderId"/>
+        <result column="order_sn" property="orderSn"/>
+        <result column="member_id" property="memberId"/>
+        <result column="flash_promotion_id" property="flashPromotionId"/>
+        <result column="flash_promotion_session_id" property="flashPromotionSessionId"/>
+        <result column="relation_id" property="relationId"/>
+        <result column="product_id" property="productId"/>
+        <result column="quantity" property="quantity"/>
+        <result column="status" property="status"/>
+        <result column="fail_reason" property="failReason"/>
+        <result column="create_time" property="createTime"/>
+        <result column="update_time" property="updateTime"/>
+    </resultMap>
+
+    <!-- request_id 有唯一索引；重复提交会抛 DuplicateKeyException，调用方捕获后按幂等处理 -->
+    <insert id="insert" parameterType="com.macro.mall.portal.domain.FlashPromotionOrderRecord"
+            useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO sms_flash_promotion_order
+          (request_id, order_id, order_sn, member_id,
+           flash_promotion_id, flash_promotion_session_id, relation_id, product_id,
+           quantity, status, create_time, update_time)
+        VALUES
+          (#{requestId}, #{orderId}, #{orderSn}, #{memberId},
+           #{flashPromotionId}, #{flashPromotionSessionId}, #{relationId}, #{productId},
+           #{quantity}, #{status}, #{createTime}, #{updateTime})
+    </insert>
+
+    <select id="selectByRequestId" resultMap="recordMap">
+        SELECT * FROM sms_flash_promotion_order WHERE request_id = #{requestId}
+    </select>
+
+    <!--
+      限购统计：status IN (0,1) —— 排队中和已建单都算已占用。
+      把「排队中」算进来是关键：否则用户在消息落库前就能把限购额度刷满。
+      失败(2) 的不算，因为库存已经回滚了，用户应该能重新抢。
+    -->
+    <select id="countMemberBought" resultType="int">
+        SELECT IFNULL(SUM(quantity), 0)
+        FROM sms_flash_promotion_order
+        WHERE member_id = #{memberId}
+          AND flash_promotion_id = #{promotionId}
+          AND flash_promotion_session_id = #{sessionId}
+          AND product_id = #{productId}
+          AND status IN (0, 1)
+    </select>
+
+    <!-- 条件更新：只有仍处于「排队中」才能置为成功，重复消费时返回 0 -->
+    <update id="markSuccess">
+        UPDATE sms_flash_promotion_order
+        SET status = 1,
+            order_id = #{orderId},
+            order_sn = #{orderSn},
+            update_time = NOW()
+        WHERE id = #{id}
+          AND status = 0
+    </update>
+
+    <update id="markFailed">
+        UPDATE sms_flash_promotion_order
+        SET status = 2,
+            fail_reason = #{failReason},
+            update_time = NOW()
+        WHERE id = #{id}
+          AND status = 0
+    </update>
+
+    <select id="selectStuckPending" resultMap="recordMap">
+        SELECT * FROM sms_flash_promotion_order
+        WHERE status = 0
+          AND create_time &lt; #{before}
+        ORDER BY create_time ASC
+        LIMIT #{limit}
+    </select>
+
+    <select id="countSuccessInSession" resultType="int">
+        SELECT COUNT(*)
+        FROM sms_flash_promotion_order
+        WHERE flash_promotion_id = #{promotionId}
+          AND flash_promotion_session_id = #{sessionId}
+          AND status = 1
+    </select>
+
+    <select id="selectByOrderId" resultMap="recordMap">
+        SELECT * FROM sms_flash_promotion_order
+        WHERE order_id = #{orderId}
+        ORDER BY id DESC
+        LIMIT 1
+    </select>
+
+    <!--
+      回滚幂等：只有 status=1（已建单）才能迁移到 3（已取消并回滚）。
+      并发取消 / 超时关单与手动取消同时发生时，只有一个调用能拿到 affected=1，
+      其余拿到 0 必须跳过 —— 这是"回滚只能做一次"的保证。
+    -->
+    <update id="markCancelled">
+        UPDATE sms_flash_promotion_order
+        SET status = 3,
+            update_time = NOW()
+        WHERE id = #{id}
+          AND status = 1
+    </update>
+
+</mapper>

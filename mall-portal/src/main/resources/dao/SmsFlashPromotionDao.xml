@@ -1,0 +1,133 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.macro.mall.portal.dao.SmsFlashPromotionDao">
+
+    <resultMap id="stockInfoMap" type="com.macro.mall.portal.domain.FlashPromotionStockInfo">
+        <id column="id" property="relationId"/>
+        <result column="flash_promotion_id" property="flashPromotionId"/>
+        <result column="flash_promotion_session_id" property="flashPromotionSessionId"/>
+        <result column="product_id" property="productId"/>
+        <result column="product_name" property="productName"/>
+        <result column="flash_promotion_price" property="flashPromotionPrice"/>
+        <result column="flash_promotion_count" property="flashPromotionCount"/>
+        <result column="flash_promotion_sold_count" property="flashPromotionSoldCount"/>
+        <result column="flash_promotion_limit" property="flashPromotionLimit"/>
+        <result column="sort" property="sort"/>
+    </resultMap>
+
+    <!-- 当前生效的活动：状态启用 + 今天落在起止日期之间（DATE() 只比较日期部分，
+         因为 start_date/end_date 是 DATE 类型，用 NOW() 直接比会被时间部分干扰） -->
+    <select id="selectActivePromotion" resultMap="com.macro.mall.mapper.SmsFlashPromotionMapper.BaseResultMap">
+        SELECT *
+        FROM sms_flash_promotion
+        WHERE status = 1
+          AND start_date &lt;= DATE(#{now})
+          AND end_date &gt;= DATE(#{now})
+        ORDER BY id DESC
+        LIMIT 1
+    </select>
+
+    <select id="selectSessionById" resultMap="com.macro.mall.mapper.SmsFlashPromotionSessionMapper.BaseResultMap">
+        SELECT *
+        FROM sms_flash_promotion_session
+        WHERE id = #{sessionId}
+          AND status = 1
+    </select>
+
+    <!-- 当前时间落在哪个场次的时间窗内 -->
+    <select id="selectActiveSession" resultMap="com.macro.mall.mapper.SmsFlashPromotionSessionMapper.BaseResultMap">
+        SELECT *
+        FROM sms_flash_promotion_session
+        WHERE status = 1
+          AND start_time &lt;= TIME(#{now})
+          AND end_time &gt;= TIME(#{now})
+        ORDER BY start_time DESC
+        LIMIT 1
+    </select>
+
+    <select id="selectStockInfoList" resultMap="stockInfoMap">
+        SELECT
+            r.id,
+            r.flash_promotion_id,
+            r.flash_promotion_session_id,
+            r.product_id,
+            p.name AS product_name,
+            r.flash_promotion_price,
+            r.flash_promotion_count,
+            r.flash_promotion_sold_count,
+            r.flash_promotion_limit,
+            r.sort
+        FROM sms_flash_promotion_product_relation r
+        LEFT JOIN pms_product p ON p.id = r.product_id
+        WHERE r.flash_promotion_id = #{promotionId}
+          AND r.flash_promotion_session_id = #{sessionId}
+          AND r.flash_promotion_price IS NOT NULL
+          AND r.flash_promotion_count IS NOT NULL
+        ORDER BY r.sort DESC, r.id ASC
+    </select>
+
+    <select id="selectStockInfo" resultMap="stockInfoMap">
+        SELECT
+            r.id,
+            r.flash_promotion_id,
+            r.flash_promotion_session_id,
+            r.product_id,
+            p.name AS product_name,
+            r.flash_promotion_price,
+            r.flash_promotion_count,
+            r.flash_promotion_sold_count,
+            r.flash_promotion_limit,
+            r.sort
+        FROM sms_flash_promotion_product_relation r
+        LEFT JOIN pms_product p ON p.id = r.product_id
+        WHERE r.id = #{relationId}
+    </select>
+
+    <select id="selectStockInfoByProduct" resultMap="stockInfoMap">
+        SELECT
+            r.id,
+            r.flash_promotion_id,
+            r.flash_promotion_session_id,
+            r.product_id,
+            p.name AS product_name,
+            r.flash_promotion_price,
+            r.flash_promotion_count,
+            r.flash_promotion_sold_count,
+            r.flash_promotion_limit,
+            r.sort
+        FROM sms_flash_promotion_product_relation r
+        LEFT JOIN pms_product p ON p.id = r.product_id
+        WHERE r.flash_promotion_id = #{promotionId}
+          AND r.flash_promotion_session_id = #{sessionId}
+          AND r.product_id = #{productId}
+          AND r.flash_promotion_price IS NOT NULL
+          AND r.flash_promotion_count IS NOT NULL
+        LIMIT 1
+    </select>
+
+    <!--
+      DB 侧原子扣减（防超卖的最终兜底）。
+      把「还剩多少」和「扣减」合成一条语句 —— 与项目里 P0 库存改造用的是同一手法。
+      关键点：这里用的是 flash_promotion_sold_count 的「相对更新」而不是写绝对值，
+      并发下不会丢失更新。
+    -->
+    <update id="lockFlashStock">
+        UPDATE sms_flash_promotion_product_relation
+        SET flash_promotion_sold_count = flash_promotion_sold_count + #{quantity}
+        WHERE id = #{relationId}
+          AND flash_promotion_count - flash_promotion_sold_count &gt;= #{quantity}
+    </update>
+
+    <!--
+      回滚：带下限保护，避免重复回滚把 sold_count 扣成负数。
+      （这正是台账 #6 那条缺陷的教训 —— 释放库存不加下限，lock_stock 会被扣成负数，
+      而负数会虚增可用库存。）
+    -->
+    <update id="releaseFlashStock">
+        UPDATE sms_flash_promotion_product_relation
+        SET flash_promotion_sold_count = flash_promotion_sold_count - #{quantity}
+        WHERE id = #{relationId}
+          AND flash_promotion_sold_count &gt;= #{quantity}
+    </update>
+
+</mapper>

@@ -6,6 +6,19 @@ spring:
   mvc:
     pathmatch:
       matching-strategy: ant_path_matcher
+  rabbitmq:
+    listener:
+      simple:
+        acknowledge-mode: auto
+        retry:
+          enabled: true
+          max-attempts: 3          # 总共尝试 3 次（首次 + 重试 2 次）
+          initial-interval: 1000ms # 首次重试等 1 秒
+          multiplier: 2.0          # 退避倍数：1s → 2s
+          max-interval: 10000ms
+        # 关键：重试耗尽后不要重新入队，否则消息会在队列里无限循环把队列堵死。
+        # 设为 false 后，被拒绝的消息会按队列配置的 x-dead-letter-exchange 进死信队列。
+        default-requeue-rejected: false
 
 mybatis:
   mapper-locations:
@@ -40,6 +53,11 @@ secure:
       # 原来的 /alipay/** 把 pay / webPay / query 也一起放开了，等于任何人可以匿名
       # 给任意订单发起支付、查询任意订单
       - /alipay/notify
+      # 秒杀：只放行「查询类」接口，让未登录用户也能看到秒杀列表。
+      # /seckill/order（下单）、/seckill/result/**（查结果）、/seckill/warmUp、
+      # /seckill/reconcile 都「有意」不放行 —— 必须登录才能调。
+      - /seckill/current
+      - /seckill/products
 
 springdoc:
   swagger-ui:

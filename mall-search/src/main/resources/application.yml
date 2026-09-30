@@ -15,6 +15,40 @@ mybatis:
     - classpath:dao/*.xml
     - classpath*:com/**/mapper/*.xml
 
+jwt:
+  tokenHeader: Authorization #JWT存储的请求头
+  # 必须与 mall-admin 用同一个密钥：后台登录拿到的 token 才能直接用来调索引维护接口
+  secret: mall-admin-secret #JWT加解密使用的密钥
+  expiration: 604800 #JWT的超期限时间(60*60*24*7)（秒）
+  tokenHead: 'Bearer '  #JWT负载中拿到开头
+
+redis:
+  database: mall
+  key:
+    resourceList: 'ums:resourceList'
+  expire:
+    common: 86400 # 24小时
+
+secure:
+  ignored:
+    urls: #安全路径白名单
+      # ---- 只放行「查询类」接口：搜索服务对前台是只读的 ----
+      - /esProduct/search
+      - /esProduct/search/**
+      - /esProduct/recommend/**
+      # ---- 其它基础路径 ----
+      - /swagger-ui.html
+      - /swagger-ui/**
+      - /v3/api-docs
+      - /v3/api-docs/**
+      - /favicon.ico
+      - /actuator/**
+      - /druid/**
+
+# 注意：/esProduct/importAll、/esProduct/create/{id}、/esProduct/delete/{id}、
+#       /esProduct/delete/batch 这四个索引维护接口「有意」不放进白名单 ——
+#       它们会触发全量导入 / 增删索引文档，属于管理操作，必须带 token 才能调用。
+
 springdoc:
   swagger-ui:
     # 修改Swagger UI路径

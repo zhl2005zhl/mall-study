@@ -1,5 +1,6 @@
 package com.macro.mall.portal.service.impl;
 
+import cn.hutool.core.collection.CollUtil;
 import cn.hutool.core.util.StrUtil;
 import com.alibaba.fastjson.JSONObject;
 import com.alipay.api.AlipayApiException;
@@ -12,15 +13,19 @@ import com.alipay.api.response.AlipayTradeQueryResponse;
 import com.macro.mall.common.exception.Asserts;
 import com.macro.mall.mapper.OmsOrderMapper;
 import com.macro.mall.model.OmsOrder;
+import com.macro.mall.model.OmsOrderExample;
+import com.macro.mall.model.UmsMember;
 import com.macro.mall.portal.config.AlipayConfig;
 import com.macro.mall.portal.domain.AliPayParam;
 import com.macro.mall.portal.service.AlipayService;
 import com.macro.mall.portal.service.OmsPortalOrderService;
+import com.macro.mall.portal.service.UmsMemberService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -40,6 +45,8 @@ public class AlipayServiceImpl implements AlipayService {
     private OmsOrderMapper orderMapper;
     @Autowired
     private OmsPortalOrderService portalOrderService;
+    @Autowired
+    private UmsMemberService memberService;
     @Override
     public String pay(AliPayParam aliPayParam) {
         AlipayTradePagePayRequest request = new AlipayTradePagePayRequest();
@@ -56,10 +63,9 @@ public class AlipayServiceImpl implements AlipayService {
         //商户订单号，商家自定义，保持唯一性
         bizContent.put("out_trade_no", aliPayParam.getOutTradeNo());
         //订单总金额以数据库中订单表中为准
-        OmsOrder order = portalOrderService.getOrderByOrderSn(aliPayParam.getOutTradeNo());
-        if(order==null||order.getPayAmount()==null){
-            Asserts.fail("订单信息或金额不能为空！");
-        }
+        // 订单总金额以数据库中订单表中为准，并且必须校验订单归属：
+        // 原实现只按 orderSn 取单，任何人拿到别人的订单号就能替别人发起支付。
+        OmsOrder order = getOwnedOrder(aliPayParam.getOutTradeNo());
         BigDecimal totalAmount = order.getPayAmount();
         //支付金额，最小值0.01元
         bizContent.put("total_amount", totalAmount);
@@ -106,6 +112,11 @@ public class AlipayServiceImpl implements AlipayService {
 
     @Override
     public String query(String outTradeNo, String tradeNo) {
+        // 归属校验：这个接口会顺带触发 paySuccessByOrderSn，而且它在白名单里曾经是匿名的，
+        // 任何人都能拿别人的订单号来查、并顺带把别人的订单改成已支付。
+        if (StrUtil.isNotEmpty(outTradeNo)) {
+            checkOrderOwnership(outTradeNo);
+        }
         AlipayTradeQueryRequest request = new AlipayTradeQueryRequest();
         //******必传参数******
         JSONObject bizContent = new JSONObject();
@@ -129,13 +140,55 @@ public class AlipayServiceImpl implements AlipayService {
         if(response.isSuccess()){
             log.info("查询支付宝账单成功！");
             if("TRADE_SUCCESS".equals(response.getTradeStatus())){
-                portalOrderService.paySuccessByOrderSn(outTradeNo,1);
+                // 只传 tradeNo 时 outTradeNo 为空，用支付宝返回的商户订单号再校验一次归属
+                String paidOrderSn = StrUtil.isNotEmpty(outTradeNo) ? outTradeNo : response.getOutTradeNo();
+                checkOrderOwnership(paidOrderSn);
+                portalOrderService.paySuccessByOrderSn(paidOrderSn,1);
             }
         } else {
             log.error("查询支付宝账单失败！");
         }
         //交易状态：WAIT_BUYER_PAY（交易创建，等待买家付款）、TRADE_CLOSED（未付款交易超时关闭，或支付完成后全额退款）、TRADE_SUCCESS（交易支付成功）、TRADE_FINISHED（交易结束，不可退款）
         return response.getTradeStatus();
+    }
+
+    /**
+     * 取出「属于自己的」待支付订单。
+     *
+     * 支付相关接口最容易漏的一类校验就是归属校验：接口有登录态，但没验证
+     * "这条数据是不是你的"。只按订单号取单的话，拿到别人的订单号就能替别人发起支付。
+     */
+    private OmsOrder getOwnedOrder(String outTradeNo) {
+        OmsOrder order = portalOrderService.getOrderByOrderSn(outTradeNo);
+        if (order == null || order.getPayAmount() == null) {
+            Asserts.fail("订单信息或金额不能为空！");
+        }
+        UmsMember currentMember = memberService.getCurrentMember();
+        if (!currentMember.getId().equals(order.getMemberId())) {
+            // 统一说「订单不存在」，不暴露「这个订单存在、只是不属于你」，
+            // 否则等于送给攻击者一个订单号探测接口
+            Asserts.fail("订单不存在！");
+        }
+        return order;
+    }
+
+    /**
+     * 校验订单归属（不过滤订单状态，用于查询 / 对账场景）。
+     */
+    private void checkOrderOwnership(String orderSn) {
+        if (StrUtil.isEmpty(orderSn)) {
+            Asserts.fail("订单不存在！");
+        }
+        OmsOrderExample example = new OmsOrderExample();
+        example.createCriteria().andOrderSnEqualTo(orderSn).andDeleteStatusEqualTo(0);
+        List<OmsOrder> orderList = orderMapper.selectByExample(example);
+        if (CollUtil.isEmpty(orderList)) {
+            Asserts.fail("订单不存在！");
+        }
+        UmsMember currentMember = memberService.getCurrentMember();
+        if (!currentMember.getId().equals(orderList.get(0).getMemberId())) {
+            Asserts.fail("订单不存在！");
+        }
     }
 
     @Override
@@ -154,10 +207,9 @@ public class AlipayServiceImpl implements AlipayService {
         //商户订单号，商家自定义，保持唯一性
         bizContent.put("out_trade_no", aliPayParam.getOutTradeNo());
         //订单总金额以数据库中订单表中为准
-        OmsOrder order = portalOrderService.getOrderByOrderSn(aliPayParam.getOutTradeNo());
-        if(order==null||order.getPayAmount()==null){
-            Asserts.fail("订单信息或金额不能为空！");
-        }
+        // 订单总金额以数据库中订单表中为准，并且必须校验订单归属：
+        // 原实现只按 orderSn 取单，任何人拿到别人的订单号就能替别人发起支付。
+        OmsOrder order = getOwnedOrder(aliPayParam.getOutTradeNo());
         BigDecimal totalAmount = order.getPayAmount();
         //支付金额，最小值0.01元
         bizContent.put("total_amount", totalAmount);

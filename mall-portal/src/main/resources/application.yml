@@ -36,7 +36,10 @@ secure:
       - /home/**
       - /product/**
       - /brand/**
-      - /alipay/**
+      # 只有异步回调必须匿名可访问（支付宝服务器要能打进来）
+      # 原来的 /alipay/** 把 pay / webPay / query 也一起放开了，等于任何人可以匿名
+      # 给任意订单发起支付、查询任意订单
+      - /alipay/notify
 
 springdoc:
   swagger-ui:

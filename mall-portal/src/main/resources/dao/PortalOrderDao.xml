@@ -87,5 +87,17 @@
         <foreach collection="itemList" item="item" separator="," open="(" close=")">
             #{item.productSkuId}
         </foreach>
+        <!--
+          下限保护：只有 lock_stock 足够时才释放。
+          原实现无条件做 lock_stock - quantity，一旦业务上重复释放（或并发重复回调），
+          lock_stock 会被扣成负数 —— 而「可用库存」是 stock - lock_stock，
+          负数会把可用库存凭空放大，等于又开了个超卖的口子。
+          加上这个条件后，不够的行不会被更新，affected rows 会小于预期，调用方可据此发现异常。
+        -->
+        AND lock_stock &gt;= CASE id
+        <foreach collection="itemList" item="item">
+            WHEN #{item.productSkuId} THEN #{item.productQuantity}
+        </foreach>
+        END
     </update>
 </mapper>

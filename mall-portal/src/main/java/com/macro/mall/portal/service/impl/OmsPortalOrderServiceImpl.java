@@ -14,9 +14,12 @@ import com.macro.mall.portal.dao.PortalOrderItemDao;
 import com.macro.mall.portal.dao.SmsCouponHistoryDao;
 import com.macro.mall.portal.domain.*;
 import com.macro.mall.portal.service.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.CollectionUtils;
 
 import java.math.BigDecimal;
@@ -31,6 +34,7 @@ import java.util.stream.Collectors;
  */
 @Service
 public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
+    private static final Logger LOGGER = LoggerFactory.getLogger(OmsPortalOrderServiceImpl.class);
     @Autowired
     private UmsMemberService memberService;
     @Autowired
@@ -91,8 +95,18 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
     }
 
     @Override
+    // @Transactional 写在实现类上而不是接口上：生成订单要写 order / order_item / 扣库存 / 用券 / 扣积分 / 删购物车，必须整体成败
+    @Transactional
     public Map<String, Object> generateOrder(OrderParam orderParam) {
-        List<OmsOrderItem> orderItemList = new ArrayList<>();
+        // ① 边界处先做入参校验，快速失败。
+        //    这一条不是"少校验了一两个字段"，而是异常以「数据库语法错误」或「NPE」的
+        //    形式穿透到客户端 —— 用户看到的是 500 和 MySQL 的报错原文（连表名都暴露了）。
+        if (orderParam == null) {
+            Asserts.fail("下单参数不能为空");
+        }
+        if (CollUtil.isEmpty(orderParam.getCartIds())) {
+            Asserts.fail("请选择要购买的商品");
+        }
         //校验收货地址
         if(orderParam.getMemberReceiveAddressId()==null){
             Asserts.fail("请选择收货地址！");
@@ -100,6 +114,20 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
         //获取购物车及优惠信息
         UmsMember currentMember = memberService.getCurrentMember();
         List<CartPromotionItem> cartPromotionItemList = cartItemService.listPromotion(currentMember.getId(), orderParam.getCartIds());
+        // ② 购物车项为空必须在这里拦住。
+        //    否则 orderItemList 为空 → orderItemDao.insertList 的空集合会让
+        //    <foreach> 展开成 "VALUES" 后面什么都没有 → MySQL 语法错误 → HTTP 500。
+        if (CollUtil.isEmpty(cartPromotionItemList)) {
+            Asserts.fail("购物车中没有可下单的商品，请重新选择");
+        }
+        // ③ 数量字段可能为 null（例如加购时字段名写错，quantity 存成了 NULL），
+        //    后面 calcTotalAmount 会直接 quantity.intValue() 触发 NPE。
+        for (CartPromotionItem cartPromotionItem : cartPromotionItemList) {
+            if (cartPromotionItem.getQuantity() == null || cartPromotionItem.getQuantity() <= 0) {
+                Asserts.fail("商品「" + cartPromotionItem.getProductName() + "」数量异常，请重新加入购物车");
+            }
+        }
+        List<OmsOrderItem> orderItemList = new ArrayList<>();
         for (CartPromotionItem cartPromotionItem : cartPromotionItemList) {
             //生成下单商品信息
             OmsOrderItem orderItem = new OmsOrderItem();
@@ -198,6 +226,10 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
         order.setOrderType(0);
         //收货人信息：姓名、电话、邮编、地址
         UmsMemberReceiveAddress address = memberReceiveAddressService.getItem(orderParam.getMemberReceiveAddressId());
+        if (address == null) {
+            // 地址被删掉 / 传了别人的地址id，原来会在这里 NPE
+            Asserts.fail("收货地址不存在，请重新选择");
+        }
         order.setReceiverName(address.getName());
         order.setReceiverPhone(address.getPhoneNumber());
         order.setReceiverPostCode(address.getPostCode());
@@ -229,7 +261,7 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
         orderItemDao.insertList(orderItemList);
         //如使用优惠券更新优惠券使用状态
         if (orderParam.getCouponId() != null) {
-            updateCouponStatus(orderParam.getCouponId(), currentMember.getId(), 1);
+            updateCouponStatus(orderParam.getCouponId(), currentMember.getId(), order.getId(), 1);
         }
         //如使用积分需要扣除积分
         if (orderParam.getUseIntegration() != null) {
@@ -250,21 +282,37 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
     }
 
     @Override
+    // @Transactional 写在实现类上而不是接口上：支付回调要改订单状态 + 扣真实库存 + 释放锁定库存，必须整体成败
+    @Transactional
     public Integer paySuccess(Long orderId, Integer payType) {
-        //修改订单支付状态
-        OmsOrder order = new OmsOrder();
-        order.setId(orderId);
-        order.setStatus(1);
-        order.setPaymentTime(new Date());
-        order.setPayType(payType);
-        orderMapper.updateByPrimaryKeySelective(order);
-        //恢复所有下单商品的锁定库存，扣减真实库存
+        // ① 原子「占位」：只有订单仍然是「待支付」才能被改成「已支付」。
+        //
+        //    支付平台的回调是「至少一次」投递（没收到 ACK 就重发），重复回调是常态，
+        //    所以幂等必须做。这里直接用「订单状态」当幂等键，不引入额外存储，零成本。
+        //
+        //    原实现是「先查订单（带 status=0 过滤）→ 再改状态 → 再扣库存」，
+        //    「查」和「改」是两步、中间没有原子性 —— 两个重复回调同时到达时会都查到 status=0，
+        //    然后都去扣库存。诡异之处在于：订单状态不会被改坏（status=1 是写绝对值，天然幂等），
+        //    但 stock = stock - N 是相对更新，重复执行就真的多扣一次。
+        //    表现出来就是「幂等看起来生效了，但它保护不了库存」。
+        //
+        //    改成一条带条件的 UPDATE 后，「判断」和「更新」在数据库里一次完成：
+        //    并发下只有一个请求 affected=1，其余全部 affected=0。
+        int affected = orderMapper.updateOrderStatusToPaid(orderId, payType);
+        if (affected == 0) {
+            // 订单不存在 / 已经是已支付 / 已被取消 —— 这次回调是重复的或非法的。
+            // 直接返回，绝不再动库存。
+            return 0;
+        }
+        // ② 只有真正「抢到」待支付状态的那个线程，才执行库存变更
+        //    恢复所有下单商品的锁定库存，扣减真实库存
         OmsOrderDetail orderDetail = portalOrderDao.getDetail(orderId);
-        int count = portalOrderDao.updateSkuStock(orderDetail.getOrderItemList());
-        return count;
+        return portalOrderDao.updateSkuStock(orderDetail.getOrderItemList());
     }
 
     @Override
+    // @Transactional 写在实现类上而不是接口上：批量取消超时订单，每条都涉及改状态 + 释放锁定库存
+    @Transactional
     public Integer cancelTimeOutOrder() {
         Integer count=0;
         OmsOrderSetting orderSetting = orderSettingMapper.selectByPrimaryKey(1L);
@@ -281,9 +329,12 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
         portalOrderDao.updateOrderStatus(ids, 4);
         for (OmsOrderDetail timeOutOrder : timeOutOrders) {
             //解除订单商品库存锁定
-            portalOrderDao.releaseSkuStockLock(timeOutOrder.getOrderItemList());
+            warnIfReleaseFailed(
+                    portalOrderDao.releaseSkuStockLock(timeOutOrder.getOrderItemList()),
+                    timeOutOrder.getOrderItemList(),
+                    "超时关单 orderSn=" + timeOutOrder.getOrderSn());
             //修改优惠券使用状态
-            updateCouponStatus(timeOutOrder.getCouponId(), timeOutOrder.getMemberId(), 0);
+            updateCouponStatus(timeOutOrder.getCouponId(), timeOutOrder.getMemberId(), null, 0);
             //返还使用积分
             if (timeOutOrder.getUseIntegration() != null) {
                 UmsMember member = memberService.getById(timeOutOrder.getMemberId());
@@ -294,6 +345,8 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
     }
 
     @Override
+    // @Transactional 写在实现类上而不是接口上：取消订单要改状态 + 释放锁定库存 + 退回优惠券，必须整体成败
+    @Transactional
     public void cancelOrder(Long orderId) {
         //查询未付款的取消订单
         OmsOrderExample example = new OmsOrderExample();
@@ -312,10 +365,13 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
             List<OmsOrderItem> orderItemList = orderItemMapper.selectByExample(orderItemExample);
             //解除订单商品库存锁定
             if (!CollectionUtils.isEmpty(orderItemList)) {
-                portalOrderDao.releaseSkuStockLock(orderItemList);
+                warnIfReleaseFailed(
+                        portalOrderDao.releaseSkuStockLock(orderItemList),
+                        orderItemList,
+                        "手动取消订单 orderId=" + orderId);
             }
             //修改优惠券使用状态
-            updateCouponStatus(cancelOrder.getCouponId(), cancelOrder.getMemberId(), 0);
+            updateCouponStatus(cancelOrder.getCouponId(), cancelOrder.getMemberId(), null, 0);
             //返还使用积分
             if (cancelOrder.getUseIntegration() != null) {
                 UmsMember member = memberService.getById(cancelOrder.getMemberId());
@@ -420,6 +476,8 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
     }
 
     @Override
+    // @Transactional 写在实现类上而不是接口上：按订单号回调，与 paySuccess 同一条链路
+    @Transactional
     public void paySuccessByOrderSn(String orderSn, Integer payType) {
         OmsOrder order = getOrderByOrderSn(orderSn);
         if(order!=null){
@@ -500,18 +558,37 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
      * @param memberId  会员id
      * @param useStatus 0->未使用；1->已使用
      */
-    private void updateCouponStatus(Long couponId, Long memberId, Integer useStatus) {
+    private void updateCouponStatus(Long couponId, Long memberId, Long orderId, Integer useStatus) {
         if (couponId == null) return;
-        //查询第一张优惠券
+        int fromStatus = useStatus == 0 ? 1 : 0;
+        // 先找出这张券里「当前正处于源状态」的那一条
         SmsCouponHistoryExample example = new SmsCouponHistoryExample();
         example.createCriteria().andMemberIdEqualTo(memberId)
-                .andCouponIdEqualTo(couponId).andUseStatusEqualTo(useStatus == 0 ? 1 : 0);
+                .andCouponIdEqualTo(couponId).andUseStatusEqualTo(fromStatus);
         List<SmsCouponHistory> couponHistoryList = couponHistoryMapper.selectByExample(example);
-        if (!CollectionUtils.isEmpty(couponHistoryList)) {
-            SmsCouponHistory couponHistory = couponHistoryList.get(0);
-            couponHistory.setUseTime(new Date());
-            couponHistory.setUseStatus(useStatus);
-            couponHistoryMapper.updateByPrimaryKeySelective(couponHistory);
+        if (CollectionUtils.isEmpty(couponHistoryList)) {
+            Asserts.fail(useStatus == 1 ? "该优惠券不可用" : "该优惠券状态异常");
+        }
+        // 关键一步：用「条件更新」原子地占住这张券。
+        //
+        // 原来的写法是「查出来 → 在内存里改字段 → updateByPrimaryKeySelective 写回」，
+        // 两笔并发的订单会查到同一条未使用的券，各自把它改成已使用 ——
+        // 结果是一张券被抵扣了两次，而且后写的那次会覆盖前一次写进去的 order_id。
+        //
+        // 改成 UPDATE ... WHERE id = ? AND use_status = ? 之后，
+        // 数据库保证只有一个请求能改成功（affected = 1），另一个拿到 0。
+        int affected = couponHistoryMapper.updateUseStatus(
+                couponHistoryList.get(0).getId(), fromStatus, useStatus, orderId);
+        if (affected == 0) {
+            if (useStatus == 1) {
+                // 下单占用失败 → 抛异常让整个下单事务回滚。
+                // 因为下单本身在 @Transactional 里，这里不需要任何补偿逻辑，
+                // 前面已经扣掉的库存、写好的订单都会被一并回滚 ——
+                // 这就是「原子更新 + 事务」的免费回滚能力。
+                Asserts.fail("该优惠券已被其他订单使用");
+            }
+            // 还原方向失败（券状态已经不是「已使用」）不需要让事务失败，忽略即可，
+            // 否则取消订单会因为券的状态异常而整个回滚
         }
     }
 
@@ -718,6 +795,25 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
     }
 
     /**
+     * 检查锁定库存释放是否全部成功。
+     *
+     * releaseSkuStockLock 已经带了 lock_stock >= quantity 的下限保护，
+     * 所以「affected rows 少于预期行数」意味着有的 SKU 锁定库存不够扣 ——
+     * 这本身就是一个值得排查的信号：说明发生了重复释放（同一个订单被取消两次、
+     * 或超时关单与手动取消并发）。
+     *
+     * 这里只告警、不抛异常：释放失败是"发现了上游的异常"，不应该让当前的
+     * 取消流程也失败；但如果默默无视，这个信号就永远浮不上来。
+     */
+    private void warnIfReleaseFailed(int affected, List<OmsOrderItem> orderItemList, String scene) {
+        if (affected < orderItemList.size()) {
+            LOGGER.warn("释放锁定库存未全部成功：{}，预期 {} 行、实际 {} 行。"
+                            + "通常是同一订单被重复取消，请排查该订单的取消链路。",
+                    scene, orderItemList.size(), affected);
+        }
+    }
+
+    /**
      * 计算总金额
      */
     private BigDecimal calcTotalAmount(List<OmsOrderItem> orderItemList) {
@@ -730,6 +826,16 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
 
     /**
      * 锁定下单商品的所有库存
+     *
+     * 【关于"要不要进一步合并成一条批量 SQL"的取舍】
+     * 每个 SKU 一次 UPDATE，下单 3 个商品就是 3 次往返。理论上可以用
+     * UPDATE ... SET lock_stock = CASE id WHEN ... END WHERE id IN (...) 合并成 1 次，
+     * 但那样 affected rows 只会告诉你"总共改了几行"，无法定位是哪一个 SKU 库存不足 ——
+     * 而这里的业务恰恰需要精确到商品名地告诉用户"库存不足：XX"。
+     *
+     * 所以结论是：一次下单的商品数通常是个位数，用少量性能换精确的错误定位更划算。
+     * （这个判断成立的前提是"下单商品数很少"。如果将来出现"整单上百个 SKU"的场景，
+     *   就要重新权衡：那时应该改成批量 SQL，再用一次 SELECT 定位失败项。）
      */
     private void lockStock(List<CartPromotionItem> cartPromotionItemList) {
         for (CartPromotionItem cartPromotionItem : cartPromotionItemList) {

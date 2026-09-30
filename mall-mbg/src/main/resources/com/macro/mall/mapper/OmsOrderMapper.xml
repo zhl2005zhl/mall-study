@@ -825,4 +825,17 @@
       modify_time = #{modifyTime,jdbcType=TIMESTAMP}
     where id = #{id,jdbcType=BIGINT}
   </update>
+
+  <!--
+    支付回调的幂等占位：只有订单仍是「待支付」才置为「已支付」。
+    status = 0 写在 WHERE 里，重复回调时 affected = 0，调用方据此直接返回。
+  -->
+  <update id="updateOrderStatusToPaid">
+    update oms_order
+    set status = 1,
+        payment_time = now(),
+        pay_type = #{payType,jdbcType=INTEGER}
+    where id = #{orderId}
+      and status = 0
+  </update>
 </mapper>

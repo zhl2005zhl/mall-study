@@ -50,7 +50,7 @@ public class OmsPromotionServiceImpl implements OmsPromotionService {
                     //单品促销使用原价
                     cartPromotionItem.setPrice(originalPrice);
                     cartPromotionItem.setReduceAmount(originalPrice.subtract(skuStock.getPromotionPrice()));
-                    cartPromotionItem.setRealStock(skuStock.getStock()-skuStock.getLockStock());
+                    cartPromotionItem.setRealStock(getAvailableStock(skuStock));
                     cartPromotionItem.setIntegration(promotionProduct.getGiftPoint());
                     cartPromotionItem.setGrowth(promotionProduct.getGiftGrowth());
                     cartPromotionItemList.add(cartPromotionItem);
@@ -70,7 +70,7 @@ public class OmsPromotionServiceImpl implements OmsPromotionService {
                         BigDecimal originalPrice = skuStock.getPrice();
                         BigDecimal reduceAmount = originalPrice.subtract(ladder.getDiscount().multiply(originalPrice));
                         cartPromotionItem.setReduceAmount(reduceAmount);
-                        cartPromotionItem.setRealStock(skuStock.getStock()-skuStock.getLockStock());
+                        cartPromotionItem.setRealStock(getAvailableStock(skuStock));
                         cartPromotionItem.setIntegration(promotionProduct.getGiftPoint());
                         cartPromotionItem.setGrowth(promotionProduct.getGiftGrowth());
                         cartPromotionItemList.add(cartPromotionItem);
@@ -93,7 +93,7 @@ public class OmsPromotionServiceImpl implements OmsPromotionService {
                         BigDecimal originalPrice = skuStock.getPrice();
                         BigDecimal reduceAmount = originalPrice.divide(totalAmount,RoundingMode.HALF_EVEN).multiply(fullReduction.getReducePrice());
                         cartPromotionItem.setReduceAmount(reduceAmount);
-                        cartPromotionItem.setRealStock(skuStock.getStock()-skuStock.getLockStock());
+                        cartPromotionItem.setRealStock(getAvailableStock(skuStock));
                         cartPromotionItem.setIntegration(promotionProduct.getGiftPoint());
                         cartPromotionItem.setGrowth(promotionProduct.getGiftGrowth());
                         cartPromotionItemList.add(cartPromotionItem);
@@ -164,7 +164,7 @@ public class OmsPromotionServiceImpl implements OmsPromotionService {
             cartPromotionItem.setReduceAmount(new BigDecimal(0));
             PmsSkuStock skuStock = getOriginalPrice(promotionProduct,item.getProductSkuId());
             if(skuStock!=null){
-                cartPromotionItem.setRealStock(skuStock.getStock()-skuStock.getLockStock());
+                cartPromotionItem.setRealStock(getAvailableStock(skuStock));
             }
             cartPromotionItem.setIntegration(promotionProduct.getGiftPoint());
             cartPromotionItem.setGrowth(promotionProduct.getGiftGrowth());
@@ -177,11 +177,11 @@ public class OmsPromotionServiceImpl implements OmsPromotionService {
         fullReductionList.sort(new Comparator<PmsProductFullReduction>() {
             @Override
             public int compare(PmsProductFullReduction o1, PmsProductFullReduction o2) {
-                return o2.getFullPrice().subtract(o1.getFullPrice()).intValue();
+                return o2.getFullPrice().compareTo(o1.getFullPrice());   // 用 compareTo，intValue() 会把小数差截成 0
             }
         });
         for(PmsProductFullReduction fullReduction:fullReductionList){
-            if(totalAmount.subtract(fullReduction.getFullPrice()).intValue()>=0){
+            if(totalAmount.compareTo(fullReduction.getFullPrice())>=0){
                 return fullReduction;
             }
         }
@@ -245,6 +245,19 @@ public class OmsPromotionServiceImpl implements OmsPromotionService {
             amount = amount.add(skuStock.getPrice().multiply(new BigDecimal(item.getQuantity())));
         }
         return amount;
+    }
+
+    /**
+     * 计算商品的可售库存：实际库存 - 已锁定库存。
+     *
+     * 这个表达式原来在本类里重复写了 4 遍（单品促销 / 打折 / 满减 / 无优惠各一遍）。
+     * 抽成一个方法的好处：
+     *   ① 口径统一 —— 不会出现「改了三处、漏了一处」，导致不同促销类型下展示的库存不一致；
+     *   ② 以后规则变化（比如再减去冻结量、或考虑预售占用）只改这一处；
+     *   ③ 名字本身说明了语义，"stock 减 lockStock" 到底是可售还是已售，不用每次都去猜。
+     */
+    private int getAvailableStock(PmsSkuStock skuStock) {
+        return skuStock.getStock() - skuStock.getLockStock();
     }
 
     /**

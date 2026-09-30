@@ -89,8 +89,51 @@ public class EsProductServiceImpl implements EsProductService {
         return productRepository.findByNameOrSubTitleOrKeywords(keyword, keyword, keyword, pageable);
     }
 
+    /** ES 默认的 max_result_window：from + size 超过它就会直接报错 */
+    private static final int MAX_RESULT_WINDOW = 10000;
+    /** 单页最大条数，防止有人用 size=100000 绕过上面的限制 */
+    private static final int MAX_PAGE_SIZE = 100;
+
+    /**
+     * 判断这次翻页是否超出 ES 能承受的深度。
+     *
+     * 说明一下这里的处理取舍：
+     *   现在的做法是「拦截 + 返回空页 + 打告警日志」，属于"让接口不 500"的止血方案。
+     *   真正要支持深翻页，应该改造成 search_after 游标分页：
+     *     · 第一页仍然用 from/size，但排序必须是一个稳定且唯一的组合
+     *       （比如 price asc, id asc —— 只按 price 排，同价商品顺序不稳定，游标会漏数据）；
+     *     · 把最后一条的排序值作为游标返回给前端；
+     *     · 后续翻页带上这个游标，ES 从游标位置继续往后取，不再受 10000 限制。
+     *   之所以没直接做游标，是因为它需要前端配合改交互（不能用"跳到第 N 页"），
+     *   属于接口契约变更，不适合和本次缺陷修复一起做。
+     */
+    private boolean exceedsMaxResultWindow(Integer pageNum, Integer pageSize) {
+        if (pageNum == null || pageSize == null || pageNum < 0 || pageSize <= 0) {
+            LOGGER.warn("搜索分页参数非法：pageNum={} pageSize={}", pageNum, pageSize);
+            return true;
+        }
+        if (pageSize > MAX_PAGE_SIZE) {
+            LOGGER.warn("搜索单页条数超限：pageSize={}（上限 {}）", pageSize, MAX_PAGE_SIZE);
+            return true;
+        }
+        int from = pageNum * pageSize;
+        if (from + pageSize > MAX_RESULT_WINDOW) {
+            LOGGER.warn("搜索翻页过深已拦截：from={} size={}（ES max_result_window={}）。"
+                            + "如需支持深翻页请改造为 search_after 游标分页。",
+                    from, pageSize, MAX_RESULT_WINDOW);
+            return true;
+        }
+        return false;
+    }
+
     @Override
     public Page<EsProduct> search(String keyword, Long brandId, Long productCategoryId, Integer pageNum, Integer pageSize,Integer sort) {
+        // 深分页保护：ES 的 max_result_window 默认是 10000，
+        // from + size 一旦超过它，ES 会直接抛异常 → 接口 500。
+        // 前台搜索页虽然不会真的翻到第 1000 页，但爬虫或者构造请求很容易触发。
+        if (exceedsMaxResultWindow(pageNum, pageSize)) {
+            return new PageImpl<>(ListUtil.empty(), PageRequest.of(pageNum, pageSize), 0);
+        }
         Pageable pageable = PageRequest.of(pageNum, pageSize);
         NativeQueryBuilder nativeQueryBuilder = new NativeQueryBuilder();
         //分页
@@ -144,9 +187,17 @@ public class EsProductServiceImpl implements EsProductService {
         }else if(sort==4){
             //按价格从高到低
             nativeQueryBuilder.withSort(Sort.by(Sort.Order.desc("price")));
+        }else{
+            //只有用户「没有指定排序」时才按相关度排。
+            //
+            //原实现是把 _score 排序无条件追加在最后，问题有两点：
+            //  ① 排序字段里一旦出现 _score，ES 就必须为每个命中文档计算打分，
+            //     无法走「不算分」的优化路径 —— 尤其是 keyword 为空、
+            //     只有过滤条件（品牌/分类）的场景，本来完全不需要打分。
+            //  ② 语义被搅浑：用户点「按价格从低到高」时，返回的顺序里
+            //     还掺了一层 _score 在里面，将来排查"为什么这两条同价商品顺序反了"会白费力气。
+            nativeQueryBuilder.withSort(Sort.by(Sort.Order.desc("_score")));
         }
-        //按相关度
-        nativeQueryBuilder.withSort(Sort.by(Sort.Order.desc("_score")));
         NativeQuery nativeQuery = nativeQueryBuilder.build();
         LOGGER.info("DSL:{}", nativeQuery.getQuery().toString());
         SearchHits<EsProduct> searchHits = elasticsearchTemplate.search(nativeQuery, EsProduct.class);

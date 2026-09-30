@@ -17,11 +17,19 @@ import java.util.Map;
  * JwtToken生成的工具类
  * JWT token的格式：header.payload.signature
  * header的格式（算法、token的类型）：
- * {"alg": "HS512","typ": "JWT"}
- * payload的格式（用户名、创建时间、生成时间）：
+ * {"alg": "HS256","typ": "JWT"}
+ * payload的格式（用户名、创建时间、过期时间）：
  * {"sub":"wang","created":1489079981393,"exp":1489684781}
  * signature的生成算法：
- * HMACSHA512(base64UrlEncode(header) + "." +base64UrlEncode(payload),secret)
+ * HMACSHA256(base64UrlEncode(header) + "." +base64UrlEncode(payload),secret)
+ *
+ * 注意：算法是 HS256 而不是 HS512 —— 这里用的是 Hutool 的
+ * {@code JWTUtil.createToken(payload, key)}，它的文档明确写的是 HS256(HmacSHA256)。
+ * 原注释写的 HS512 与实际不符，已按实际改正。
+ *
+ * exp 的单位是「秒」（RFC 7519 规定 NumericDate 为 Unix 秒），
+ * 不是毫秒 —— 详见 generateToken / isTokenExpired。
+ *
  * Created by macro on 2018/4/26.
  * Refactored to use Hutool JWTUtil
  */
@@ -29,6 +37,8 @@ public class JwtTokenUtil {
     private static final Logger LOGGER = LoggerFactory.getLogger(JwtTokenUtil.class);
     private static final String CLAIM_KEY_USERNAME = "sub";
     private static final String CLAIM_KEY_CREATED = "created";
+    /** RFC 7519 规定 exp 是「秒级」时间戳，这里显式声明，避免有人再按毫秒用 */
+    private static final String CLAIM_KEY_EXPIRED = "exp";
     @Value("${jwt.secret}")
     private String secret;
     @Value("${jwt.expiration}")
@@ -45,11 +55,16 @@ public class JwtTokenUtil {
 
     /**
      * 根据负责生成JWT的token
+     *
+     * exp 用「秒」：RFC 7519 的 NumericDate 定义为「自 1970-01-01T00:00:00Z 起的秒数」。
+     * 原实现用的是毫秒，虽然自己签自己验能对上，但：
+     *   ① 其它语言的 JWT 库（java-jwt、jjwt、pyjwt 等）都按秒解析，跨语言调用会直接判成"已过期"或"2148 年才过期"；
+     *   ② 用标准库或第三方工具校验时结果不可预期。
      */
     private String generateToken(Map<String, Object> claims) {
-        // 设置过期时间
-        long expireTime = System.currentTimeMillis() + expiration * 1000;
-        claims.put("exp", expireTime);
+        // 设置过期时间（秒）
+        long expireTimeSeconds = System.currentTimeMillis() / 1000 + expiration;
+        claims.put(CLAIM_KEY_EXPIRED, expireTimeSeconds);
         return JWTUtil.createToken(claims, getSigningKey());
     }
 
@@ -100,6 +115,9 @@ public class JwtTokenUtil {
 
     /**
      * 判断token是否已经失效
+     *
+     * exp 是「秒级」时间戳，所以这里也必须用秒去比 —— 原来拿毫秒和毫秒比虽然能跑通，
+     * 但一旦 exp 按 RFC 改成秒（或与别的库互操作），毫秒比较会永远判成"没过期"。
      */
     private boolean isTokenExpired(String token) {
         try {
@@ -108,12 +126,12 @@ public class JwtTokenUtil {
             if (payload == null) {
                 return true;
             }
-            Object exp = payload.get("exp");
+            Object exp = payload.get(CLAIM_KEY_EXPIRED);
             if (exp == null) {
                 return false;
             }
-            long expTime = exp instanceof Long ? (Long) exp : ((Number) exp).longValue();
-            return expTime < System.currentTimeMillis();
+            long expTimeSeconds = exp instanceof Long ? (Long) exp : ((Number) exp).longValue();
+            return expTimeSeconds < System.currentTimeMillis() / 1000;
         } catch (Exception e) {
             return true;
         }
@@ -127,11 +145,10 @@ public class JwtTokenUtil {
         if (payload == null) {
             return null;
         }
-        Object exp = payload.get("exp");
-        if (exp instanceof Long) {
-            return new Date((Long) exp);
-        } else if (exp instanceof Integer) {
-            return new Date(((Integer) exp).longValue());
+        Object exp = payload.get(CLAIM_KEY_EXPIRED);
+        if (exp instanceof Number) {
+            // exp 是秒，Date 需要毫秒，这里换算
+            return new Date(((Number) exp).longValue() * 1000);
         }
         return null;
     }

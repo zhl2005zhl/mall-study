@@ -102,7 +102,15 @@ public class UmsAdminServiceImpl implements UmsAdminService {
         try {
             UserDetails userDetails = loadUserByUsername(username);
             if(!passwordEncoder.matches(password,userDetails.getPassword())){
-                Asserts.fail("密码不正确");
+                // 这里的提示必须和「用户不存在」完全一致，否则就成了一个用户名枚举接口：
+                //   · 用户不存在 → loadUserByUsername 抛 UsernameNotFoundException，
+                //     它是 AuthenticationException 的子类，会被下面的 catch 接住并吞掉，
+                //     最后由 controller 统一返回「用户名或密码错误」；
+                //   · 用户存在但密码错 → Asserts.fail 抛的是 ApiException（RuntimeException），
+                //     不会被那个 catch 接住，会直接把「密码不正确」透传给客户端。
+                // 两个提示不一致，攻击者就能靠错误信息判断某个用户名是否存在，
+                // 先枚举出有效账号、再针对性爆破密码。
+                Asserts.fail("用户名或密码错误");
             }
             if(!userDetails.isEnabled()){
                 Asserts.fail("帐号已被禁用");

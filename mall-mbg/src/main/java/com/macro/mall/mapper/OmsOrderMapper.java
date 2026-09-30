@@ -27,4 +27,12 @@ public interface OmsOrderMapper {
     int updateByPrimaryKeySelective(OmsOrder row);
 
     int updateByPrimaryKey(OmsOrder row);
+
+    /**
+     * 把订单从「待支付」原子置为「已支付」（支付回调的幂等键）
+     *
+     * 只有当前 status = 0 时才更新。返回 0 说明这个订单已经被处理过了
+     * （重复回调 / 已取消 / 不存在），调用方应直接返回，不要再去扣库存。
+     */
+    int updateOrderStatusToPaid(@Param("orderId") Long orderId, @Param("payType") Integer payType);
 }

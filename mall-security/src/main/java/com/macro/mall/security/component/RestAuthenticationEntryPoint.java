@@ -22,6 +22,10 @@ public class RestAuthenticationEntryPoint implements AuthenticationEntryPoint {
         response.setHeader("Cache-Control","no-cache");
         response.setCharacterEncoding("UTF-8");
         response.setContentType("application/json");
+        // 未认证就是 401，必须把状态码也设上。
+        // 只写响应体不设 status 的话 HTTP 状态是 200，前端 fetch/axios 的 401 拦截器
+        // 和网关、监控的"错误率"统计都感知不到，只能靠业务码去猜。
+        response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
         response.getWriter().println(JSONUtil.parse(CommonResult.unauthorized(authException.getMessage())));
         response.getWriter().flush();
     }

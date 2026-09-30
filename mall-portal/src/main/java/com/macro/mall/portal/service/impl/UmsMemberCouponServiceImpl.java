@@ -11,6 +11,7 @@ import com.macro.mall.portal.service.UmsMemberCouponService;
 import com.macro.mall.portal.service.UmsMemberService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.util.ArrayList;
@@ -40,25 +41,38 @@ public class UmsMemberCouponServiceImpl implements UmsMemberCouponService {
     @Autowired
     private PmsProductMapper productMapper;
     @Override
+    @Transactional
     public void add(Long couponId) {
         UmsMember currentMember = memberService.getCurrentMember();
-        //获取优惠券信息，判断数量
+        //获取优惠券信息
         SmsCoupon coupon = couponMapper.selectByPrimaryKey(couponId);
         if(coupon==null){
             Asserts.fail("优惠券不存在");
-        }
-        if(coupon.getCount()<=0){
-            Asserts.fail("优惠券已经领完了");
         }
         Date now = new Date();
         if(now.before(coupon.getEnableTime())){
             Asserts.fail("优惠券还没到领取时间");
         }
-        //判断用户领取的优惠券数量是否超过限制
+        // ① 先原子扣减库存。
+        //    原实现是「读 count → 内存里减 1 → 把绝对值写回去」，这是典型的
+        //    丢失更新：两个线程同时读到 count=1，各自减成 0 再写回，结果只减了 1 次却发了 2 张券。
+        //    改成 UPDATE ... SET count = count - 1 WHERE id = ? AND count > 0 之后，
+        //    「判断还有没有」和「扣减」在数据库里一次完成，由数据库保证互斥。
+        //    另外一个附带好处：这条 UPDATE 会持有该优惠券行的行锁，
+        //    直到事务提交，等于顺手把同一张券的并发领取串行化了 —— 下面第 ② 步的
+        //    「每人限领」检查因此也变得可靠（在锁的保护下读到的是一致的快照）。
+        int affected = couponMapper.decreaseCount(couponId);
+        if (affected == 0) {
+            // 影响行数为 0 → count 已经不 > 0，即被领完了
+            Asserts.fail("优惠券已经领完了");
+        }
+        // ② 判断用户领取的优惠券数量是否超过限制
+        //    （此时已持有该券的行锁，读到的计数不会被其它并发领取干扰）
         SmsCouponHistoryExample couponHistoryExample = new SmsCouponHistoryExample();
         couponHistoryExample.createCriteria().andCouponIdEqualTo(couponId).andMemberIdEqualTo(currentMember.getId());
         long count = couponHistoryMapper.countByExample(couponHistoryExample);
         if(count>=coupon.getPerLimit()){
+            // 抛异常 → 整个事务回滚 → 上面扣掉的库存也会一起还原，不会白白消耗
             Asserts.fail("您已经领取过该优惠券");
         }
         //生成领取优惠券历史
@@ -73,10 +87,6 @@ public class UmsMemberCouponServiceImpl implements UmsMemberCouponService {
         //未使用
         couponHistory.setUseStatus(0);
         couponHistoryMapper.insert(couponHistory);
-        //修改优惠券表的数量、领取数量
-        coupon.setCount(coupon.getCount()-1);
-        coupon.setReceiveCount(coupon.getReceiveCount()==null?1:coupon.getReceiveCount()+1);
-        couponMapper.updateByPrimaryKey(coupon);
     }
 
     /**
@@ -129,7 +139,7 @@ public class UmsMemberCouponServiceImpl implements UmsMemberCouponService {
                 //判断是否满足优惠起点
                 //计算购物车商品的总价
                 BigDecimal totalAmount = calcTotalAmount(cartItemList);
-                if(now.before(endTime)&&totalAmount.subtract(minPoint).intValue()>=0){
+                if(now.before(endTime)&&totalAmount.compareTo(minPoint)>=0){
                     enableList.add(couponHistoryDetail);
                 }else{
                     disableList.add(couponHistoryDetail);
@@ -142,7 +152,7 @@ public class UmsMemberCouponServiceImpl implements UmsMemberCouponService {
                     productCategoryIds.add(categoryRelation.getProductCategoryId());
                 }
                 BigDecimal totalAmount = calcTotalAmountByproductCategoryId(cartItemList,productCategoryIds);
-                if(now.before(endTime)&&totalAmount.intValue()>0&&totalAmount.subtract(minPoint).intValue()>=0){
+                if(now.before(endTime)&&totalAmount.compareTo(BigDecimal.ZERO)>0&&totalAmount.compareTo(minPoint)>=0){
                     enableList.add(couponHistoryDetail);
                 }else{
                     disableList.add(couponHistoryDetail);
@@ -155,7 +165,7 @@ public class UmsMemberCouponServiceImpl implements UmsMemberCouponService {
                     productIds.add(productRelation.getProductId());
                 }
                 BigDecimal totalAmount = calcTotalAmountByProductId(cartItemList,productIds);
-                if(now.before(endTime)&&totalAmount.intValue()>0&&totalAmount.subtract(minPoint).intValue()>=0){
+                if(now.before(endTime)&&totalAmount.compareTo(BigDecimal.ZERO)>0&&totalAmount.compareTo(minPoint)>=0){
                     enableList.add(couponHistoryDetail);
                 }else{
                     disableList.add(couponHistoryDetail);

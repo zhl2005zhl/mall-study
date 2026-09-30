@@ -1,6 +1,7 @@
 package com.macro.mall.portal.service.impl;
 
 import cn.hutool.core.collection.CollUtil;
+import com.macro.mall.common.exception.Asserts;
 import com.macro.mall.mapper.OmsCartItemMapper;
 import com.macro.mall.model.OmsCartItem;
 import com.macro.mall.model.OmsCartItemExample;
@@ -13,6 +14,7 @@ import com.macro.mall.portal.service.OmsPromotionService;
 import com.macro.mall.portal.service.UmsMemberService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.CollectionUtils;
 
 import java.util.ArrayList;
@@ -116,8 +118,28 @@ public class OmsCartItemServiceImpl implements OmsCartItemService {
     }
 
     @Override
+    @Transactional
     public int updateAttr(OmsCartItem cartItem) {
-        //删除原购物车信息
+        // ① 归属校验：只能修改自己的购物车项。
+        //
+        //    原实现是 updateByPrimaryKeySelective(updateCart)，而 updateCart 里只塞了 id，
+        //    WHERE 条件就是主键 —— 意味着只要知道别人的购物车项 id，就能把它置为已删除。
+        //    这是典型的水平越权（IDOR）：接口本身有登录校验，但没校验"这条数据是不是你的"。
+        //    正确做法是把 memberId 也作为查询条件，让数据库层直接过滤掉不属于自己的数据。
+        UmsMember currentMember = memberService.getCurrentMember();
+        OmsCartItemExample example = new OmsCartItemExample();
+        example.createCriteria().andIdEqualTo(cartItem.getId())
+                .andMemberIdEqualTo(currentMember.getId())
+                .andDeleteStatusEqualTo(0);
+        List<OmsCartItem> owned = cartItemMapper.selectByExample(example);
+        if (CollUtil.isEmpty(owned)) {
+            // 不区分"不存在"和"不是你的"，避免给攻击者提供探测信息
+            Asserts.fail("购物车项不存在");
+        }
+        // ② 「删旧项 + 加新项」必须放在同一个事务里。
+        //    原实现是两步相互独立的写操作：如果 add() 抛异常（比如商品已下架），
+        //    旧项已经被置为删除、新项又没建起来 —— 用户会发现购物车里的商品凭空消失。
+        //    加上 @Transactional 之后，任一步失败都会整体回滚。
         OmsCartItem updateCart = new OmsCartItem();
         updateCart.setId(cartItem.getId());
         updateCart.setModifyDate(new Date());

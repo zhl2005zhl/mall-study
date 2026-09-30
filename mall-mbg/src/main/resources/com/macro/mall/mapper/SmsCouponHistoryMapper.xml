@@ -303,4 +303,25 @@
       order_sn = #{orderSn,jdbcType=VARCHAR}
     where id = #{id,jdbcType=BIGINT}
   </update>
+
+  <!--
+    原子占用优惠券：只有当前还是「未使用」才置为「已使用」。
+    use_status = 0 写在 WHERE 里，天然互斥 —— 并发下只有一张订单能改成功。
+  -->
+  <update id="updateUseStatus">
+    update sms_coupon_history
+    set use_status = #{toStatus},
+        use_time =
+        <choose>
+            <when test="toStatus == 1">now()</when>
+            <otherwise>null</otherwise>
+        </choose>,
+        order_id =
+        <choose>
+            <when test="toStatus == 1">#{orderId,jdbcType=BIGINT}</when>
+            <otherwise>null</otherwise>
+        </choose>
+    where id = #{id}
+      and use_status = #{fromStatus}
+  </update>
 </mapper>

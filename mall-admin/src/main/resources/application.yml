@@ -33,8 +33,16 @@ redis:
 secure:
   ignored:
     urls: #安全路径白名单
-      - /swagger-ui/
-      - /v3/api-docs/*
+      # Swagger 相关路径要能匿名访问，否则文档页会被 401 挡住。
+      # 原来的写法匹配不上实际路径：
+      #   /swagger-ui/    → 只能精确匹配这一个路径（少了 **），
+      #                     swagger-ui 的 JS/CSS 与 /swagger-ui/index.html 都过不去；
+      #   /v3/api-docs/*  → 能匹配 /v3/api-docs/xxx，却匹配不到 /v3/api-docs 本身，
+      #                     而前端拉取文档用的正是 /v3/api-docs（无后缀）。
+      - /swagger-ui.html
+      - /swagger-ui/**
+      - /v3/api-docs
+      - /v3/api-docs/**
       - /*/*.html
       - /*/*.js
       - /*/*.css

@@ -27,4 +27,12 @@ public interface SmsCouponMapper {
     int updateByPrimaryKeySelective(SmsCoupon row);
 
     int updateByPrimaryKey(SmsCoupon row);
+
+    /**
+     * 原子扣减优惠券库存（防超发）
+     *
+     * 「还有没有库存」和「扣减库存」在数据库里一次完成，
+     * 返回 0 表示 count &lt;= 0（已领完），调用方据此判断失败。
+     */
+    int decreaseCount(@Param("couponId") Long couponId);
 }

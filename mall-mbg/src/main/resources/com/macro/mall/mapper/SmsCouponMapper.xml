@@ -412,4 +412,17 @@
       member_level = #{memberLevel,jdbcType=INTEGER}
     where id = #{id,jdbcType=BIGINT}
   </update>
+
+  <!--
+    原子扣减优惠券库存：把「判断还有没有」和「扣减」合成一条语句。
+    count > 0 这个条件写在 WHERE 里，由数据库保证互斥，
+    并发下不会出现「两个线程都读到 count=1、都扣成 0」的丢失更新。
+  -->
+  <update id="decreaseCount">
+    update sms_coupon
+    set count = count - 1,
+        receive_count = ifnull(receive_count, 0) + 1
+    where id = #{couponId}
+      and count &gt; 0
+  </update>
 </mapper>

@@ -2,6 +2,8 @@ package com.macro.mall.service.impl;
 
 import cn.hutool.core.util.StrUtil;
 import com.github.pagehelper.PageHelper;
+import com.macro.mall.common.constant.CacheKeys;
+import com.macro.mall.common.service.RedisService;
 import com.macro.mall.mapper.SmsHomeAdvertiseMapper;
 import com.macro.mall.model.SmsHomeAdvertise;
 import com.macro.mall.model.SmsHomeAdvertiseExample;
@@ -22,19 +24,25 @@ import java.util.List;
 public class SmsHomeAdvertiseServiceImpl implements SmsHomeAdvertiseService {
     @Autowired
     private SmsHomeAdvertiseMapper advertiseMapper;
+    @Autowired
+    private RedisService redisService;
 
     @Override
     public int create(SmsHomeAdvertise advertise) {
         advertise.setClickCount(0);
         advertise.setOrderCount(0);
-        return advertiseMapper.insert(advertise);
+        int count = advertiseMapper.insert(advertise);
+        evictHomeContentCache();
+        return count;
     }
 
     @Override
     public int delete(List<Long> ids) {
         SmsHomeAdvertiseExample example = new SmsHomeAdvertiseExample();
         example.createCriteria().andIdIn(ids);
-        return advertiseMapper.deleteByExample(example);
+        int count = advertiseMapper.deleteByExample(example);
+        evictHomeContentCache();
+        return count;
     }
 
     @Override
@@ -42,7 +50,9 @@ public class SmsHomeAdvertiseServiceImpl implements SmsHomeAdvertiseService {
         SmsHomeAdvertise record = new SmsHomeAdvertise();
         record.setId(id);
         record.setStatus(status);
-        return advertiseMapper.updateByPrimaryKeySelective(record);
+        int count = advertiseMapper.updateByPrimaryKeySelective(record);
+        evictHomeContentCache();
+        return count;
     }
 
     @Override
@@ -53,7 +63,22 @@ public class SmsHomeAdvertiseServiceImpl implements SmsHomeAdvertiseService {
     @Override
     public int update(Long id, SmsHomeAdvertise advertise) {
         advertise.setId(id);
-        return advertiseMapper.updateByPrimaryKeySelective(advertise);
+        int count = advertiseMapper.updateByPrimaryKeySelective(advertise);
+        evictHomeContentCache();
+        return count;
+    }
+
+    /**
+     * 后台改了广告位就清掉首页缓存。
+     *
+     * 为什么是「删缓存」而不是「改缓存」：写缓存要多维护一份组装逻辑，
+     * 还容易和 portal 侧的写入打架；直接删掉让下次请求回源重建，最不容易出错。
+     *
+     * 同样的做法要套用到其它首页素材上（推荐品牌 / 新品 / 人气 / 专题 / 秒杀），
+     * 这里以广告位为代表。
+     */
+    private void evictHomeContentCache() {
+        redisService.del(CacheKeys.HOME_CONTENT);
     }
 
     @Override

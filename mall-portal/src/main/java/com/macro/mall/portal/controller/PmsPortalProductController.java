@@ -57,6 +57,11 @@ public class PmsPortalProductController {
     @ResponseBody
     public CommonResult<PmsPortalProductDetail> detail(@PathVariable Long id) {
         PmsPortalProductDetail productDetail = portalProductService.detail(id);
+        if (productDetail == null) {
+            // 商品不存在是一个可预期的业务结果，返回明确提示，
+            // 而不是让它以 NPE / 500 的形式抛出去
+            return CommonResult.failed("商品不存在");
+        }
         return CommonResult.success(productDetail);
     }
 }

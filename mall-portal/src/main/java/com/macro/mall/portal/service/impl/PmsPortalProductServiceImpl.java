@@ -3,6 +3,8 @@ package com.macro.mall.portal.service.impl;
 import cn.hutool.core.collection.CollUtil;
 import cn.hutool.core.util.StrUtil;
 import com.github.pagehelper.PageHelper;
+import com.macro.mall.common.constant.CacheKeys;
+import com.macro.mall.common.service.RedisService;
 import com.macro.mall.mapper.*;
 import com.macro.mall.model.*;
 import com.macro.mall.portal.dao.PortalProductDao;
@@ -14,6 +16,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.stream.Collectors;
 
 /**
@@ -22,6 +25,16 @@ import java.util.stream.Collectors;
  */
 @Service
 public class PmsPortalProductServiceImpl implements PmsPortalProductService {
+
+    /** 商品详情缓存基础 TTL（秒）。商品信息变动不频繁，可以比首页长一些 */
+    private static final long PRODUCT_DETAIL_TTL = 300;
+    /** 防雪崩：TTL 随机抖动上限（秒）*/
+    private static final int TTL_JITTER_BOUND = 60;
+    /** 空值缓存 TTL（秒）。比正常数据短，避免商品上架后长时间查不到 */
+    private static final long PRODUCT_DETAIL_NULL_TTL = 60;
+
+    @Autowired
+    private RedisService redisService;
     @Autowired
     private PmsProductMapper productMapper;
     @Autowired
@@ -83,9 +96,45 @@ public class PmsPortalProductServiceImpl implements PmsPortalProductService {
 
     @Override
     public PmsPortalProductDetail detail(Long id) {
+        String key = CacheKeys.PRODUCT_DETAIL_PREFIX + id;
+
+        // ① cache-aside：先查缓存
+        Object cached = redisService.get(key);
+        if (cached instanceof PmsPortalProductDetail) {
+            return (PmsPortalProductDetail) cached;
+        }
+        if (CacheKeys.NULL_MARKER.equals(cached)) {
+            // ② 命中「空值标记」：这个 id 确实不存在，直接返回，不打数据库
+            return null;
+        }
+
+        PmsPortalProductDetail result = buildDetail(id);
+        if (result == null) {
+            // ③ 防穿透：把「查不到」也缓存起来（空值标记 + 短 TTL）。
+            //    这个接口的 id 来自 URL，是外部可控的 —— 如果有人拿一堆不存在的 id 刷，
+            //    不缓存空值就等于每个请求都要穿透到数据库。
+            redisService.set(key, CacheKeys.NULL_MARKER, PRODUCT_DETAIL_NULL_TTL);
+            return null;
+        }
+        // ④ 防雪崩：TTL 加随机抖动
+        long ttl = PRODUCT_DETAIL_TTL + ThreadLocalRandom.current().nextInt(TTL_JITTER_BOUND);
+        redisService.set(key, result, ttl);
+        return result;
+    }
+
+    /**
+     * 商品详情的原始聚合逻辑（原来 detail() 里的内容）。
+     * 商品不存在时返回 null —— 注意这里顺带修掉了一个隐患：
+     * 原实现紧接着就取 product.getBrandId()，商品不存在会直接 NPE 变成 500，
+     * 而不是「商品不存在」这种可预期的业务结果。
+     */
+    private PmsPortalProductDetail buildDetail(Long id) {
+        PmsProduct product = productMapper.selectByPrimaryKey(id);
+        if (product == null) {
+            return null;
+        }
         PmsPortalProductDetail result = new PmsPortalProductDetail();
         //获取商品信息
-        PmsProduct product = productMapper.selectByPrimaryKey(id);
         result.setProduct(product);
         //获取品牌信息
         PmsBrand brand = brandMapper.selectByPrimaryKey(product.getBrandId());

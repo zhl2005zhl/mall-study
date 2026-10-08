@@ -26,6 +26,27 @@
             o.id = #{orderId}
     </select>
 
+    <!--
+      查一批超时未支付订单。
+
+      ★ 三个必须做的约束（原实现都没有，实测 33 万条超时订单时直接抛 PacketTooBigException）：
+
+      1) **必须有 LIMIT**：原实现一次把「所有」超时订单连明细捞进内存。
+         大促后积压几十万条时，光是这一条查询就能把堆撑爆。
+
+      2) **LIMIT 要作用在「订单」上，不是 JOIN 之后的行上**：
+         直接 `LEFT JOIN ... LIMIT 500` 限的是连接后的行数，
+         一个订单有 N 个明细就占 N 行，实际只能取到 500/N 个订单。
+         所以用派生表先把订单 id 圈出来，再拿这批 id 去 JOIN 明细。
+
+      3) **派生表里必须 ORDER BY id**（这是最容易漏的一点）：
+         没有 ORDER BY 时，`LIMIT` 取哪几条由执行计划决定、每次可能不一样 ——
+         会导致「有的订单被反复取到、有的永远轮不到」。
+         加上 ORDER BY id ASC 后，每次都是从最小 id 开始处理，
+         已处理的订单因为 status 变了自然被排除，**进度单调向前、可续跑**。
+
+      MySQL 5.7 不支持在 IN 子查询里直接写 LIMIT，必须套一层派生表，这是语法限制。
+    -->
     <select id="getTimeOutOrders" resultMap="orderDetailMap">
         SELECT
             o.id,
@@ -44,7 +65,19 @@
             LEFT JOIN oms_order_item ot ON o.id = ot.order_id
         WHERE
             o.status = 0
-            AND o.create_time &lt; date_add(NOW(), INTERVAL -#{minute} MINUTE);
+            AND o.delete_status = 0
+            AND o.create_time &lt; date_add(NOW(), INTERVAL -#{minute} MINUTE)
+            AND o.id IN (
+                SELECT id FROM (
+                    SELECT id FROM oms_order
+                    WHERE status = 0
+                      AND delete_status = 0
+                      AND create_time &lt; date_add(NOW(), INTERVAL -#{minute} MINUTE)
+                    ORDER BY id ASC
+                    LIMIT #{limit}
+                ) batch_ids
+            )
+        ORDER BY o.id ASC
     </select>
 
     <update id="updateSkuStock">

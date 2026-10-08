@@ -17,6 +17,27 @@ public interface EsProductService {
     int importAll();
 
     /**
+     * 把单个商品的索引状态「收敛」到与数据库一致。
+     *
+     * 这是自动同步链路的核心方法：它**不是**"执行某个操作"，而是
+     * "让索引和数据库对齐"。内部会回查数据库判断该商品现在应不应该出现在索引里：
+     *   · 应该（未删除 && 已上架）→ upsert
+     *   · 不应该（已删除 / 已下架）→ 从索引删除
+     *
+     * ★ 后半句是关键。原来的 create(id) 只会做 upsert，
+     * 下架商品时 getAllEsProductList 返回空列表、于是"什么都不做"，
+     * 索引里的旧文档就永远留着了 —— 这才是"下架了还能搜到"的真正原因。
+     */
+    void syncProduct(Long id);
+
+    /**
+     * 批量收敛。定时对账与消息消费都走这个入口。
+     *
+     * @return 实际发生变更（新增/更新/删除）的商品数
+     */
+    int syncProducts(List<Long> ids);
+
+    /**
      * 根据id删除商品
      */
     void delete(Long id);

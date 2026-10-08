@@ -23,9 +23,15 @@ public interface PortalOrderDao {
 
     /**
      * 获取超时订单
+     *
      * @param minute 超时时间（分）
+     * @param limit  本次最多取多少个订单
+     *               <p>
+     *               为什么要加 limit：原实现一次性把「所有」超时订单连明细捞出来，
+     *               大促后积压几十万条时（本项目实测 33 万）会直接打爆数据库报文上限和 JVM 堆。
+     *               改成每次只取一批、循环处理，才能做到「失败可续跑、内存可控」。
      */
-    List<OmsOrderDetail> getTimeOutOrders(@Param("minute") Integer minute);
+    List<OmsOrderDetail> getTimeOutOrders(@Param("minute") Integer minute, @Param("limit") Integer limit);
 
     /**
      * 批量修改订单状态

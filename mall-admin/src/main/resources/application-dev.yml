@@ -25,6 +25,12 @@ spring:
       password: # Redis服务器连接密码（默认为空）
       timeout: 300ms # 连接超时时间（毫秒）
 
+  rabbitmq:
+    host: localhost
+    port: 5672
+    virtual-host: /mall
+    username: mall
+    password: mall
 minio:
   endpoint: http://localhost:9000 #MinIO服务所在地址
   bucketName: mall #存储桶名称

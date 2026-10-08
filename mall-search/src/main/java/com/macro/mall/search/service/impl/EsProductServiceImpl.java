@@ -59,6 +59,82 @@ public class EsProductServiceImpl implements EsProductService {
         productRepository.deleteById(id);
     }
 
+    /**
+     * 把单个商品的索引状态收敛到与数据库一致。
+     *
+     * 【为什么判断条件要从"够不够上榜"来推，而不是从"操作是什么"来推】
+     * 消息里不携带操作类型（详见 ProductSyncMessage 的注释），
+     * 所以这里统一问一个问题：getAllEsProductList(id) 有没有返回数据？
+     * 那条 SQL 的条件是 `delete_status = 0 and publish_status = 1`，
+     * 也就是说 —— **它返回的行 = 这个商品应该出现在索引里的唯一判据**。
+     *
+     * 这样"该不该在索引里"的规则只有一处定义（那条 SQL），
+     * 不会出现"上架路径写了、下架路径忘了"的不一致。
+     */
+    @Override
+    public void syncProduct(Long id) {
+        if (id == null) {
+            return;
+        }
+        List<EsProduct> list = productDao.getAllEsProductList(id);
+        if (CollectionUtils.isEmpty(list)) {
+            // 已删除 / 已下架 / 不存在 → 必须从索引里移除。
+            // 这一句就是台账 #9「下架商品仍能被搜到」的修复点。
+            //
+            // ★ 为什么要先 existsById 再删，而不是直接 deleteById：
+            //   Spring Data ES 的 deleteById 在文档不存在时会抛 DocumentMissingException。
+            //   而"下架一个从没导入过索引的商品"是完全正常的（新建商品默认未上架，
+            //   下架它时索引里本来就没有），如果不判存在，这条路径会整个抛异常，
+            //   导致同批其它商品也一起同步失败。
+            //   多一次 existsById 的代价只发生在这条罕见路径上（写路径才是热路径），
+            //   换来的是"删除操作天然幂等"——这比省一次往返重要得多。
+            if (productRepository.existsById(id)) {
+                productRepository.deleteById(id);
+                LOGGER.info("商品已从索引移除（下架或删除）：id={}", id);
+            } else {
+                // 索引里本来就没有 → 目标状态已经达成，属于正常情况，不需要日志噪音
+                LOGGER.debug("商品本就不在索引中，无需移除：id={}", id);
+            }
+        } else {
+            // 按 id upsert：Spring Data ES 的 save 是「存在则覆盖、不存在则新建」，
+            // 所以新增和修改走同一条路径，不需要区分
+            productRepository.save(list.get(0));
+            LOGGER.debug("商品索引已更新：id={} name={}", id, list.get(0).getName());
+        }
+    }
+
+    /**
+     * 批量收敛。
+     *
+     * 注意这里**逐条处理、让单条失败不影响其它条**，但最后会汇总失败数。
+     * 为什么不用 saveAll 批量提交：批量写一旦中间失败，很难说清"哪些成功了"，
+     * 而 ES 是允许延迟的，逐条写的开销在这个量级下完全可接受；
+     * 换来的是**每条商品的成败都可追溯**。
+     */
+    @Override
+    public int syncProducts(List<Long> ids) {
+        if (CollectionUtils.isEmpty(ids)) {
+            return 0;
+        }
+        int changed = 0;
+        List<Long> failed = new ArrayList<>();
+        for (Long id : ids) {
+            try {
+                syncProduct(id);
+                changed++;
+            } catch (Exception e) {
+                failed.add(id);
+                LOGGER.error("商品索引收敛失败：id={}", id, e);
+            }
+        }
+        if (!failed.isEmpty()) {
+            // 有失败就抛出去，让上层（对账任务/消费者）知道这批没处理干净。
+            // 静默吞掉失败会让"对账显示 0 差异"变成一句假话。
+            throw new IllegalStateException("有 " + failed.size() + " 个商品索引收敛失败：" + failed);
+        }
+        return changed;
+    }
+
     @Override
     public EsProduct create(Long id) {
         EsProduct result = null;

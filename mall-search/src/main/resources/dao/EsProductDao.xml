@@ -43,4 +43,15 @@
             and p.id=#{id}
         </if>
     </select>
+    <!--
+      对账用：DB 侧「应该出现在索引里」的权威 id 集合。
+      条件的口径必须和 getAllEsProductList 完全一致（delete_status=0 and publish_status=1），
+      否则对账会持续报告"差异"，而实际上是两处规则写得不一样。
+      —— 这也是为什么"该不该上榜"这条规则最好只有一处定义。
+    -->
+    <select id="getPublishedProductIds" resultType="java.lang.Long">
+        SELECT id FROM pms_product
+        WHERE delete_status = 0 AND publish_status = 1
+    </select>
+
 </mapper>

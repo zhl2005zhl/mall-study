@@ -21,6 +21,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.util.CollectionUtils;
 
 import java.math.BigDecimal;
@@ -36,6 +37,11 @@ import java.util.stream.Collectors;
 @Service
 public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
     private static final Logger LOGGER = LoggerFactory.getLogger(OmsPortalOrderServiceImpl.class);
+
+    /** 批量关单：每批处理多少个订单。500 条 id 拼成的 IN 列表约 7KB，远低于报文上限 */
+    private static final int CANCEL_BATCH_SIZE = 500;
+    /** 批量关单：单次任务最多处理多少批（500 × 100 = 5 万条），避免一次跑太久 */
+    private static final int CANCEL_MAX_BATCHES = 100;
     @Autowired
     private UmsMemberService memberService;
     @Autowired
@@ -82,6 +88,13 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
      */
     @Autowired
     private SeckillService seckillService;
+    /**
+     * 用于「每批一个独立事务」。
+     * 用 TransactionTemplate 而不是在方法上加 @Transactional，是因为后者会被自调用绕过代理，
+     * 而且这里需要的是「循环里每一轮各自开事务」，注解表达不了这个语义。
+     */
+    @Autowired
+    private TransactionTemplate transactionTemplate;
 
     @Override
     public ConfirmOrderResult generateConfirmOrder(List<Long> cartIds) {
@@ -323,29 +336,91 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
         return portalOrderDao.updateSkuStock(orderDetail.getOrderItemList());
     }
 
+    /**
+     * 批量取消超时未支付订单。
+     *
+     * ============================ 改造说明（台账 #27）============================
+     * 【原来错在哪】一次性查出「所有」超时订单，把它们的 id 全部拼进一个
+     * `UPDATE ... WHERE id IN (...)`。没有任何分批与上限 ——
+     * 本项目实测环境积压 33 万条超时订单时，拼出的 SQL 约 10MB，
+     * 超过 max_allowed_packet（默认 4MB），直接抛 PacketTooBigException，
+     * **整批一条都关不掉，对应的锁定库存也全都不释放**。
+     *
+     * 【为什么这是真问题而不只是"测试数据太多"】：
+     * 这个接口在线上没有任何兜底，只要超时订单积压到一定量（大促后很常见）
+     * 就必然触发，而且失败是"整体失败"，不是部分成功。调大 max_allowed_packet
+     * 只是把阈值往后推，订单再多一倍还是会炸 —— 分批才是根治。
+     *
+     * 【改造后的三点变化】
+     *   ① 每次只取一批（SQL 里带 LIMIT，且 LIMIT 作用在订单上、带 ORDER BY id
+     *      保证进度单调向前 —— 详见 PortalOrderDao.xml 里的注释）
+     *   ② 每批用**独立事务**（TransactionTemplate），失败只影响那一批，
+     *      下一次任务从断点继续 —— 天然可续跑
+     *   ③ 单次任务有批次上限，避免一次跑太久占着调度线程
+     *
+     * 【为什么把方法上的 @Transactional 去掉了】
+     * 这个方法现在是一个"编排者"：它只负责循环取批、开事务。
+     * 真正需要事务边界的是「一批的处理」，所以事务下沉到 cancelOneBatch。
+     * 如果继续在方法上加 @Transactional，就会变成"整个循环一个大事务" ——
+     * 那正是要避免的：跑几分钟的长事务会长时间持锁、撑大 undo log，
+     * 而且第 80 批失败会让前 79 批全部回滚，白做。
+     */
     @Override
-    // @Transactional 写在实现类上而不是接口上：批量取消超时订单，每条都涉及改状态 + 释放锁定库存
-    @Transactional
     public Integer cancelTimeOutOrder() {
-        Integer count=0;
         OmsOrderSetting orderSetting = orderSettingMapper.selectByPrimaryKey(1L);
-        //查询超时、未支付的订单及订单详情
-        List<OmsOrderDetail> timeOutOrders = portalOrderDao.getTimeOutOrders(orderSetting.getNormalOrderOvertime());
-        if (CollectionUtils.isEmpty(timeOutOrders)) {
-            return count;
+        Integer overtime = orderSetting.getNormalOrderOvertime();
+        int total = 0;
+
+        for (int round = 1; round <= CANCEL_MAX_BATCHES; round++) {
+            // 取一批（SQL 里带 LIMIT，不会再一次性捞全量）
+            List<OmsOrderDetail> batch = portalOrderDao.getTimeOutOrders(overtime, CANCEL_BATCH_SIZE);
+            if (CollectionUtils.isEmpty(batch)) {
+                break;   // 没有更多超时订单了
+            }
+            // 一批一个事务：失败只影响这一批，前面已提交的不受影响
+            Integer done = transactionTemplate.execute(status -> cancelOneBatch(batch));
+            total += done == null ? 0 : done;
+
+            // 不足一批说明已经处理完，不用再多查一次
+            if (batch.size() < CANCEL_BATCH_SIZE) {
+                break;
+            }
         }
-        //修改订单状态为交易取消
-        List<Long> ids = new ArrayList<>();
-        for (OmsOrderDetail timeOutOrder : timeOutOrders) {
-            ids.add(timeOutOrder.getId());
+
+        if (total >= CANCEL_BATCH_SIZE * CANCEL_MAX_BATCHES) {
+            // 打满了上限，说明还有积压没处理完，留个线索给运维
+            LOGGER.warn("批量关单达到单次上限（{} 批 × {} 条 = {} 条），仍有超时订单待下一轮处理",
+                    CANCEL_MAX_BATCHES, CANCEL_BATCH_SIZE, CANCEL_BATCH_SIZE * CANCEL_MAX_BATCHES);
         }
+        LOGGER.info("批量关单完成：本次共取消 {} 个超时订单", total);
+        return total;
+    }
+
+    /**
+     * 取消一批订单（独立事务单元）。
+     */
+    private Integer cancelOneBatch(List<OmsOrderDetail> batch) {
+        // 去重：resultMap 已用 <collection> 把 JOIN 行折叠成「一订单一对象」，
+        // 这里再 distinct 一次是防御性的 —— id 会直接拼进 SQL 的 IN (...)，重复只会让语句白白变大
+        List<Long> ids = batch.stream()
+                .map(OmsOrderDetail::getId)
+                .distinct()
+                .collect(Collectors.toList());
+        // 修改订单状态为交易取消
         portalOrderDao.updateOrderStatus(ids, 4);
-        for (OmsOrderDetail timeOutOrder : timeOutOrders) {
+        for (OmsOrderDetail timeOutOrder : batch) {
             //解除订单商品库存锁定
-            warnIfReleaseFailed(
-                    portalOrderDao.releaseSkuStockLock(timeOutOrder.getOrderItemList()),
-                    timeOutOrder.getOrderItemList(),
-                    "超时关单 orderSn=" + timeOutOrder.getOrderSn());
+            // ★ 必须先判空：releaseSkuStockLock 内部是 <foreach> 拼 id 列表，
+            //   传空集合会渲染出 `id IN ()` 这种非法 SQL，直接抛语法错误。
+            //   单笔取消那条路径（cancelOrder）本来就有这个判断，批量这条漏了 —— 不一致。
+            //   实测确实踩到：早前造的压力测试数据只有订单主表、没有明细，
+            //   一调这个接口就报 "You have an error in your SQL syntax ... near 'END WHERE id IN'"。
+            if (!CollectionUtils.isEmpty(timeOutOrder.getOrderItemList())) {
+                warnIfReleaseFailed(
+                        portalOrderDao.releaseSkuStockLock(timeOutOrder.getOrderItemList()),
+                        timeOutOrder.getOrderItemList(),
+                        "超时关单 orderSn=" + timeOutOrder.getOrderSn());
+            }
             // ★ 秒杀订单要一并回滚秒杀库存
             rollbackSeckillIfNeeded(timeOutOrder.getId());
             //修改优惠券使用状态
@@ -356,7 +431,7 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
                 memberService.updateIntegration(timeOutOrder.getMemberId(), member.getIntegration() + timeOutOrder.getUseIntegration());
             }
         }
-        return timeOutOrders.size();
+        return batch.size();
     }
 
     @Override

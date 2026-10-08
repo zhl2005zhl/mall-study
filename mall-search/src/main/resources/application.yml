@@ -6,6 +6,18 @@ spring:
   mvc:
     pathmatch:
       matching-strategy: ant_path_matcher
+  rabbitmq:
+    listener:
+      simple:
+        acknowledge-mode: auto
+        retry:
+          enabled: true
+          max-attempts: 3          # 商品索引同步重试 3 次
+          initial-interval: 1000ms
+          multiplier: 2.0
+          max-interval: 10000ms
+        # 重试耗尽后不要重新入队（会让队列无限循环），改为进死信队列由对账兜底
+        default-requeue-rejected: false
 
 server:
   port: 18088
@@ -66,5 +78,9 @@ springdoc:
     - group: 'mall-search'
       packages-to-scan: com.macro.mall.search.controller
 
-
-
+# 商品索引同步相关
+mall:
+  es-sync:
+    reconcile:
+      enabled: true
+      cron: "0 */10 * * * ?"   # 每 10 分钟对账一次

@@ -2,6 +2,26 @@
 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
 <mapper namespace="com.macro.mall.portal.dao.SmsFlashPromotionDao">
 
+    <!--
+      ============ 复用片段：什么算「活动/场次正在生效」 ============
+      抽成片段的原因：这条规则现在有两个使用场景 ——
+        · 展示（挑一个出来给首页）  · 校验（判断某个 id 是否生效）
+      如果两处各写一遍，将来改了条件（比如加个"排除测试活动"）很容易只改一处，
+      就会出现"首页显示有活动、但下单说活动不存在"这种自相矛盾的现象。
+      → 同一条业务规则只能有一处定义。
+    -->
+    <sql id="promotionActiveCondition">
+        status = 1
+        AND start_date &lt;= DATE(#{now})
+        AND end_date &gt;= DATE(#{now})
+    </sql>
+
+    <sql id="sessionActiveCondition">
+        status = 1
+        AND start_time &lt;= TIME(#{now})
+        AND end_time &gt;= TIME(#{now})
+    </sql>
+
     <resultMap id="stockInfoMap" type="com.macro.mall.portal.domain.FlashPromotionStockInfo">
         <id column="id" property="relationId"/>
         <result column="flash_promotion_id" property="flashPromotionId"/>
@@ -20,9 +40,7 @@
     <select id="selectActivePromotion" resultMap="com.macro.mall.mapper.SmsFlashPromotionMapper.BaseResultMap">
         SELECT *
         FROM sms_flash_promotion
-        WHERE status = 1
-          AND start_date &lt;= DATE(#{now})
-          AND end_date &gt;= DATE(#{now})
+        WHERE <include refid="promotionActiveCondition"/>
         ORDER BY id DESC
         LIMIT 1
     </select>
@@ -34,13 +52,35 @@
           AND status = 1
     </select>
 
+    <!--
+      ============ 校验用：按 id 判断「这个活动自身」是否生效 ============
+      与展示用的区别：**没有 LIMIT，判断对象就是传入的那个 id**。
+      命中 → 生效；不命中 → 不生效。
+
+      ★ 为什么不能用展示用的那个方法代替：
+        展示用的带 ORDER BY id DESC LIMIT 1，同一时刻有多个活动生效时只返回 id 最大的。
+        拿它和请求里的 id 做 equals 比较，会导致"请求一个确实生效的活动却被拒绝"。
+    -->
+    <select id="selectActivePromotionById" resultMap="com.macro.mall.mapper.SmsFlashPromotionMapper.BaseResultMap">
+        SELECT *
+        FROM sms_flash_promotion
+        WHERE id = #{id}
+          AND <include refid="promotionActiveCondition"/>
+    </select>
+
+    <!-- 校验用：按 id 判断「这个场次自身」是否在时间窗内（同上，不带 LIMIT） -->
+    <select id="selectActiveSessionById" resultMap="com.macro.mall.mapper.SmsFlashPromotionSessionMapper.BaseResultMap">
+        SELECT *
+        FROM sms_flash_promotion_session
+        WHERE id = #{id}
+          AND <include refid="sessionActiveCondition"/>
+    </select>
+
     <!-- 当前时间落在哪个场次的时间窗内 -->
     <select id="selectActiveSession" resultMap="com.macro.mall.mapper.SmsFlashPromotionSessionMapper.BaseResultMap">
         SELECT *
         FROM sms_flash_promotion_session
-        WHERE status = 1
-          AND start_time &lt;= TIME(#{now})
-          AND end_time &gt;= TIME(#{now})
+        WHERE <include refid="sessionActiveCondition"/>
         ORDER BY start_time DESC
         LIMIT 1
     </select>

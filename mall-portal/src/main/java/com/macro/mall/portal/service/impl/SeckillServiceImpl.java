@@ -149,10 +149,14 @@ public class SeckillServiceImpl implements SeckillService {
 
     @Override
     public int warmUp(Long promotionId, Long sessionId, boolean force) {
-        SmsFlashPromotion promotion = flashPromotionDao.selectActivePromotion(new Date());
-        if (promotion == null || !promotion.getId().equals(promotionId)) {
+        Date now = new Date();
+        // 与 submit 用同一套校验：判断「传入的这个 id 自身」是否生效
+        SmsFlashPromotion promotion = flashPromotionDao.selectActivePromotionById(promotionId, now);
+        if (promotion == null) {
             Asserts.fail("秒杀活动不存在或已结束");
         }
+        // 预热允许对「当前未生效但已启用」的场次做（比如活动开始前提前预热），
+        // 所以这里用 selectSessionById（只校验存在且启用），不用校验时间窗。
         SmsFlashPromotionSession session = flashPromotionDao.selectSessionById(sessionId);
         if (session == null) {
             Asserts.fail("秒杀场次不存在或已停用");
@@ -173,15 +177,31 @@ public class SeckillServiceImpl implements SeckillService {
         }
 
         // ---------- 1. 校验活动与场次是否真的在生效（绝不信前端传的值） ----------
+        //
+        // ★ 这里的校验对象是「**请求里那个 id 自身**是否生效」，不是「它是否等于系统挑中的那个」。
+        //
+        //  原来的写法是：
+        //      SmsFlashPromotionSession active = dao.selectActiveSession(now);   // 带 LIMIT 1
+        //      if (!active.getId().equals(request.getSessionId())) fail(...);
+        //  这在**同一时刻只有一个场次生效**时碰巧等价，但现实不成立 ——
+        //  例如「全天场次 00:00-23:59」与「08:00-10:00 场次」在 09:00 都生效，
+        //  而 selectActiveSession 只会返回 start_time 最大的那个。
+        //  结果就是：用户请求另一个**确实在生效**的场次，会被莫名其妙地拒绝。
+        //
+        //  改成 selectActiveXxxById 之后，判断依据从"系统选了谁"变成"事实是什么"，
+        //  语义上也更直白：命中即生效，不命中即不生效（不带 LIMIT，判断对象就是传入的 id）。
+        //
+        //  注意这段校验仍然不能省：它的作用之一是防止用户传一个
+        //  **已经结束、但 Redis 库存还没清理**的场次 id 来绕过活动时间限制。
         Date now = new Date();
-        SmsFlashPromotion promotion = flashPromotionDao.selectActivePromotion(now);
-        if (promotion == null || !promotion.getId().equals(request.getFlashPromotionId())) {
+        SmsFlashPromotion promotion = flashPromotionDao.selectActivePromotionById(
+                request.getFlashPromotionId(), now);
+        if (promotion == null) {
             Asserts.fail("秒杀活动不存在或已结束");
         }
-        SmsFlashPromotionSession activeSession = flashPromotionDao.selectActiveSession(now);
-        if (activeSession == null || !activeSession.getId().equals(request.getFlashPromotionSessionId())) {
-            // 关键：校验「当前时间确实落在请求的这个场次里」。
-            // 否则用户可以传一个已经结束（库存还没清）的场次 id 来绕过活动时间限制。
+        SmsFlashPromotionSession activeSession = flashPromotionDao.selectActiveSessionById(
+                request.getFlashPromotionSessionId(), now);
+        if (activeSession == null) {
             Asserts.fail("当前不在该秒杀场次时间内");
         }
 
@@ -235,10 +255,16 @@ public class SeckillServiceImpl implements SeckillService {
                 request.getFlashPromotionSessionId(), request.getProductId(),
                 member.getId(), quantity, limit);
         if (code != SeckillStockManager.RESULT_SUCCESS) {
+            // 注意：RESULT_NOT_WARMED 的提示原来写的是「秒杀尚未开始或已结束」，
+            // 这是**误导**的 —— 活动明明在生效、只是 Redis 里还没预热库存
+            // （比如场次刚开始、预热任务还没跑到）。两件事的排查方向完全不同：
+            //   · "活动未开始" → 去查活动/场次的时间配置
+            //   · "库存未预热" → 去查预热任务有没有跑、Redis key 在不在
+            // 提示写错了，运维会朝错误的方向查。错误信息要指出**真实原因**。
             String reason = switch ((int) code) {
                 case (int) SeckillStockManager.RESULT_OUT_OF_STOCK -> "已被抢完";
                 case (int) SeckillStockManager.RESULT_LIMIT_EXCEEDED -> "超过每人限购数量";
-                default -> "秒杀尚未开始或已结束";
+                default -> "秒杀库存尚未就绪，请稍后重试";
             };
             // 预扣失败不是系统故障，是正常业务结果：标记流水失败即可，不需要补偿
             flashPromotionOrderDao.markFailed(record.getId(), reason);

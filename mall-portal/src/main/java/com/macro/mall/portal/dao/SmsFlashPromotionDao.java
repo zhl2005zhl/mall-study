@@ -22,9 +22,26 @@ import java.util.List;
 public interface SmsFlashPromotionDao {
 
     /**
-     * 查当前生效的秒杀活动（status=1 且今天落在起止日期之间）
+     * 查当前生效的秒杀活动（status=1 且今天落在起止日期之间）。
+     *
+     * ★ **这个方法的语义是「现在该展示哪一个活动」，不是「某个活动现在生效吗」。**
+     *   因为同一时刻可能有多个活动同时生效，而展示场景必须给出一个确定的答案，
+     *   所以它带 LIMIT 1。校验场景请用下面的 selectActivePromotionById。
      */
     SmsFlashPromotion selectActivePromotion(@Param("now") Date now);
+
+    /**
+     * ★ 校验用：按 id 查活动，**并判断这个活动自身当前是否生效**。
+     *
+     * 与上面那个方法的区别是「判断的对象」：
+     *   · selectActivePromotion    → 我要挑一个出来展示（LIMIT 1）
+     *   · selectActivePromotionById → 这个指定的活动现在生效吗（有就生效、没有就不生效）
+     *
+     * 用错会导致：请求一个**确实在生效**的活动，却因为「它不是系统挑中的那个」而被拒绝。
+     *
+     * @return 生效则返回该活动，否则返回 null
+     */
+    SmsFlashPromotion selectActivePromotionById(@Param("id") Long id, @Param("now") Date now);
 
     /**
      * 按 id 查场次（用于校验请求里的场次 id 真实存在且启用）
@@ -32,9 +49,24 @@ public interface SmsFlashPromotionDao {
     SmsFlashPromotionSession selectSessionById(@Param("sessionId") Long sessionId);
 
     /**
-     * 查当前时间落在这个时间窗内的场次
+     * 查当前时间落在这个时间窗内的场次。
+     *
+     * ★ 同样地，**语义是「现在该展示哪一个场次」**（ORDER BY start_time DESC LIMIT 1），
+     *   不是「某个场次现在生效吗」。校验场景请用 selectActiveSessionById。
      */
     SmsFlashPromotionSession selectActiveSession(@Param("now") Date now);
+
+    /**
+     * ★ 校验用：按 id 查场次，**并判断这个场次自身当前是否在时间窗内**。
+     *
+     * 为什么必须有这个方法：同一时刻可以有两个以上场次同时生效
+     * （例如「全天场次 00:00-23:59」与「08:00-10:00 场次」在 09:00 都成立）。
+     * 如果用 selectActiveSession 的结果做 `equals` 比较，
+     * 用户请求另一个**确实生效**的场次就会被错误拒绝。
+     *
+     * @return 生效则返回该场次，否则返回 null
+     */
+    SmsFlashPromotionSession selectActiveSessionById(@Param("id") Long id, @Param("now") Date now);
 
     /**
      * 查某个活动×场次下的全部秒杀商品库存行（含已售数量）

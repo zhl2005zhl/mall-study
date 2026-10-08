@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.macro.mall.portal.dao.PmsCommentDao">
+
+    <resultMap id="summaryMap" type="com.macro.mall.portal.domain.PmsCommentSummary">
+        <result column="total_count" property="totalCount"/>
+        <result column="good_count" property="goodCount"/>
+        <result column="star5" property="star5"/>
+        <result column="star4" property="star4"/>
+        <result column="star3" property="star3"/>
+        <result column="star2" property="star2"/>
+        <result column="star1" property="star1"/>
+    </resultMap>
+
+    <!--
+      手写 INSERT：显式带上 member_id。
+      不用 MBG 的 insertSelective，因为那个方法按"生成时的表结构"拼字段，
+      不认识后补的 member_id，用它插入会让 member_id 永远是 NULL。
+    -->
+    <insert id="insertComment" parameterType="com.macro.mall.model.PmsComment"
+            useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO pms_comment
+          (product_id, member_id, member_nick_name, member_icon, product_name,
+           star, member_ip, create_time, show_status, product_attribute,
+           collect_couont, read_count, content, pics, replay_count)
+        VALUES
+          (#{productId}, #{memberId}, #{memberNickName}, #{memberIcon}, #{productName},
+           #{star}, #{memberIp}, #{createTime}, #{showStatus}, #{productAttribute},
+           #{collectCouont}, #{readCount}, #{content}, #{pics}, #{replayCount})
+    </insert>
+
+    <!--
+      校验：该会员是否有「已完成」的订单包含这个商品。
+      订单状态 3 = 已完成（对应 OmsPortalOrderServiceImpl.confirmReceiveOrder 里 order.setStatus(3)）。
+      用 EXISTS 而不是 COUNT(*)：我们只关心"有没有"，让数据库找到第一条就可以停，
+      不需要把所有匹配行都数一遍。
+    -->
+    <select id="countMemberCompletedPurchase" resultType="int">
+        SELECT COUNT(*) FROM (
+            SELECT 1
+            FROM oms_order o
+            JOIN oms_order_item oi ON oi.order_id = o.id
+            WHERE o.member_id = #{memberId}
+              AND oi.product_id = #{productId}
+              AND o.status = 3
+            LIMIT 1
+        ) t
+    </select>
+
+    <!-- 去重：该会员对该商品已发表过的评价数 -->
+    <select id="countMemberComment" resultType="int">
+        SELECT COUNT(*) FROM pms_comment
+        WHERE member_id = #{memberId} AND product_id = #{productId}
+    </select>
+
+    <!--
+      一次扫完评价统计。
+      用 SUM(CASE WHEN ...) 把 5 个星级的计数压进一条 SQL：
+        · 避免"三次查询之间数据变化"导致总数与分布对不上
+        · 少两次数据库往返（三次查询扫的是同一批行）
+
+      条件里的 show_status = 1：只统计审核通过、前台可见的评价 ——
+      口径必须和列表接口一致，否则会出现"详情页说 100 条评价、列表只显示 80 条"。
+    -->
+    <select id="selectSummary" resultMap="summaryMap">
+        SELECT
+            COUNT(*)                                            AS total_count,
+            SUM(CASE WHEN star >= 4 THEN 1 ELSE 0 END)          AS good_count,
+            SUM(CASE WHEN star = 5 THEN 1 ELSE 0 END)           AS star5,
+            SUM(CASE WHEN star = 4 THEN 1 ELSE 0 END)           AS star4,
+            SUM(CASE WHEN star = 3 THEN 1 ELSE 0 END)           AS star3,
+            SUM(CASE WHEN star = 2 THEN 1 ELSE 0 END)           AS star2,
+            SUM(CASE WHEN star = 1 THEN 1 ELSE 0 END)           AS star1
+        FROM pms_comment
+        WHERE product_id = #{productId}
+          AND show_status = 1
+    </select>
+
+    <!--
+      原子自增。写成 read_count = read_count + 1 而不是"查出来加一再写回"：
+      后者是 read-modify-write，并发下会丢失更新
+      （两个请求都读到 100、都写回 101，实际应该是 102）。
+      与台账 #1「锁库存丢失更新」是同一类问题的不同字段。
+    -->
+    <update id="incrReadCount">
+        UPDATE pms_comment SET read_count = IFNULL(read_count, 0) + 1 WHERE id = #{id}
+    </update>
+
+    <update id="incrCollectCount">
+        UPDATE pms_comment SET collect_couont = IFNULL(collect_couont, 0) + 1 WHERE id = #{id}
+    </update>
+
+</mapper>

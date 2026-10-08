@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.macro.mall.dao.PmsCommentDao">
+
+    <select id="selectList" resultMap="com.macro.mall.mapper.PmsCommentMapper.BaseResultMap">
+        SELECT * FROM pms_comment
+        <where>
+            <if test="param.productName != null and param.productName != ''">
+                AND product_name LIKE CONCAT('%', #{param.productName}, '%')
+            </if>
+            <if test="param.memberNickName != null and param.memberNickName != ''">
+                AND member_nick_name LIKE CONCAT('%', #{param.memberNickName}, '%')
+            </if>
+            <if test="param.star != null">
+                AND star = #{param.star}
+            </if>
+            <if test="param.showStatus != null">
+                AND show_status = #{param.showStatus}
+            </if>
+        </where>
+        ORDER BY create_time DESC, id DESC
+    </select>
+
+    <!--
+      批量审核（修改显示状态）。
+      用一条 UPDATE ... IN (...) 而不是循环单条更新：
+        · N 条记录从 N 次往返变成 1 次
+        · 而且有原子性 —— 循环更新中途失败会留下"一半已审、一半未审"的中间状态
+
+      ★ 注意 ids 的上限由 Service 层控制（见 PmsCommentServiceImpl.MAX_BATCH_SIZE）。
+        这正是台账 #27 的教训：**IN 列表不能无界**。虽然这里的 ids 来自管理端请求、
+        不会像定时任务那样一次捞出几十万条，但"依赖调用方自觉"不是好设计 ——
+        在入口处加一个上限，成本几乎为零。
+    -->
+    <update id="updateShowStatus">
+        UPDATE pms_comment
+        SET show_status = #{showStatus}
+        WHERE id IN
+        <foreach collection="ids" item="id" separator="," open="(" close=")">
+            #{id}
+        </foreach>
+    </update>
+
+    <delete id="deleteByIds">
+        DELETE FROM pms_comment
+        WHERE id IN
+        <foreach collection="ids" item="id" separator="," open="(" close=")">
+            #{id}
+        </foreach>
+    </delete>
+
+    <!--
+      回复数 +1（原子自增）。
+      必须写成相对更新 —— 与 read_count 同理，写绝对值会在并发下丢失更新。
+    -->
+    <update id="incrReplayCount">
+        UPDATE pms_comment SET replay_count = IFNULL(replay_count, 0) + 1 WHERE id = #{commentId}
+    </update>
+
+</mapper>

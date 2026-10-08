@@ -56,6 +56,14 @@ secure:
       # 秒杀：只放行「查询类」接口，让未登录用户也能看到秒杀列表。
       # /seckill/order（下单）、/seckill/result/**（查结果）、/seckill/warmUp、
       # /seckill/reconcile 都「有意」不放行 —— 必须登录才能调。
+      # 商品评价：查询类接口放行（评价是给所有浏览者看的，不是私人数据；
+      # 要求登录才能看评价，等于把最重要的购买决策依据藏起来）
+      - /member/comment/list
+      - /member/comment/summary
+      - /member/comment/replay/**
+      - /member/comment/readCount/**
+      # 注意：/member/comment/create（发评价）与 /collect/**（点赞）
+      # 「有意」不放行 —— 它们必须绑定"是谁"
       - /seckill/current
       - /seckill/products
 

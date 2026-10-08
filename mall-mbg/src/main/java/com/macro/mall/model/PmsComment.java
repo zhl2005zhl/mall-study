@@ -9,6 +9,21 @@ public class PmsComment implements Serializable {
 
     private Long productId;
 
+    /**
+     * 会员ID
+     *
+     * ★ 这个字段不是 MBG 生成的（原表没有），是补上的。
+     *   原因：评价需要两个能力，而它们都依赖"这条评价是谁发的" ——
+     *     ① 每人每商品只能评价一次（去重）
+     *     ② 查"我的评价"
+     *   用 member_nick_name 替代是不行的：昵称会重名、而且可以被改，
+     *   拿它当身份标识去重，一旦用户改名或与他人重名就会出错。
+     *
+     * 注意：重新跑 MBG 会覆盖掉这个字段，届时需要重新补（与本项目
+     * 给 Mapper 加自定义方法是同一类情况）。
+     */
+    private Long memberId;
+
     private String memberNickName;
 
     private String productName;
@@ -48,6 +63,14 @@ public class PmsComment implements Serializable {
 
     public void setId(Long id) {
         this.id = id;
+    }
+
+    public Long getMemberId() {
+        return memberId;
+    }
+
+    public void setMemberId(Long memberId) {
+        this.memberId = memberId;
     }
 
     public Long getProductId() {

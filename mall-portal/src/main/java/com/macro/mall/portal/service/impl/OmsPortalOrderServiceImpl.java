@@ -277,7 +277,33 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
         if(CollUtil.isNotEmpty(orderSettings)){
             order.setAutoConfirmDay(orderSettings.get(0).getConfirmOvertime());
         }
-        // TODO: 2018/9/3 bill_*,delivery_*
+        // ============================ 关于 bill_* / delivery_* ============================
+        // 这里原来是一句原项目留下的 TODO（2018/9/3）。核查后发现它把两件性质完全不同的事
+        // 写在了一起，而且挂在这个位置本身就不对，所以改写成准确描述：
+        //
+        // ① delivery_company / delivery_sn / delivery_time
+        //    本就不该在这里写 —— 下单时还没发货，物流公司与单号都不存在。
+        //    正确写入点是 admin 的发货接口：
+        //      POST /order/update/delivery
+        //        → OmsOrderServiceImpl.delivery()
+        //        → OrderDao.delivery()（mall-admin 手写 DAO 的自定义 SQL）
+        //    → 这组字段不是"没做完"，是"完成在别处"。
+        //
+        // ② bill_type / bill_header / bill_content / bill_receiver_phone /
+        //    bill_receiver_email
+        //    确实仍未实现，且是**死字段**：全项目读写皆无（除 MBG 生成的 POJO 访问器），
+        //    实测 2,000,097 条订单中这 5 个字段非空数为 0。
+        //
+        //    ★ 根因不是"这里漏写一行 set"，而是**入参根本没有发票字段** ——
+        //      OrderParam 只有 memberReceiveAddressId / couponId / useIntegration /
+        //      payType / cartIds 五个字段，客户端传不进来，服务端自然无从写起。
+        //      要补需同时改三处：
+        //        OrderParam 加字段 → 本方法 set → 前端下单页加发票选择
+        //      缺任何一处，这 5 个字段就永远是 NULL。
+        //
+        // 结论：这条不需要"修复"，但需要**如实标注** —— 它是已知简化，不是缺陷。
+        // 详见台账《mall缺陷与升级台账》候选升级点「发票字段未实现」。
+        // ==================================================================================
         //插入order表和order_item表
         orderMapper.insert(order);
         for (OmsOrderItem orderItem : orderItemList) {

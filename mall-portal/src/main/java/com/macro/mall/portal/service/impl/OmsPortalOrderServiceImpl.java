@@ -618,6 +618,12 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
 
     /**
      * 生成18位订单编号:8位日期+2位平台号码+2位支付方式+6位以上自增id
+     *
+     * 【空值兜底】下单时前端通常不传 payType（支付方式要到发起支付时才确定），
+     * 此时 order.getPayType() 为 null，而 String.format("%02d", null) 不会抛异常，
+     * 它会输出字面量 "null" —— 订单号会变成 2026101901null000001 这种畸形串。
+     * 脏订单号会沿着 orderSn 传到支付回调（paySuccessByOrderSn 按 orderSn 查单）、
+     * 退款与售后申请，一旦落库就很难追溯，所以在生成处兜底成 0（未支付）。
      */
     private String generateOrderSn(OmsOrder order) {
         StringBuilder sb = new StringBuilder();
@@ -625,8 +631,8 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
         String key = REDIS_DATABASE+":"+ REDIS_KEY_ORDER_ID + date;
         Long increment = redisService.incr(key, 1);
         sb.append(date);
-        sb.append(String.format("%02d", order.getSourceType()));
-        sb.append(String.format("%02d", order.getPayType()));
+        sb.append(String.format("%02d", order.getSourceType() == null ? 0 : order.getSourceType()));
+        sb.append(String.format("%02d", order.getPayType() == null ? 0 : order.getPayType()));
         String incrementStr = increment.toString();
         if (incrementStr.length() <= 6) {
             sb.append(String.format("%06d", increment));

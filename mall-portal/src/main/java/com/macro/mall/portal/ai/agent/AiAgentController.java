@@ -15,8 +15,10 @@ import org.springframework.ai.chat.model.Generation;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.tool.ToolCallbackProvider;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.security.concurrent.DelegatingSecurityContextExecutorService;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.ai.chat.model.ChatModel;
+import org.springframework.ai.deepseek.DeepSeekChatOptions;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -121,12 +123,29 @@ public class AiAgentController {
      * 为什么必须有：一次模型调用可能因为网络卡住无限期挂着，
      * 而 Agent 循环是同步的，卡住就意味着线程一直被占。
      * 用单独的线程池 + Future.get(timeout) 是成本最低的实现方式。
+     *
+     * ============================ 关键：必须传递 SecurityContext ============================
+     * 踩过的坑（真机验证暴露的，不接真模型根本发现不了）：
+     *   SecurityContextHolder 默认用 ThreadLocal 存储，**不会跨线程传递**。
+     *   而 Agent 循环跑在上述线程池里，工具内部 memberService.getCurrentMember()
+     *   取到的是 null，直接抛：
+     *     NullPointerException: Cannot invoke "Authentication.getPrincipal()" because "auth" is null
+     *
+     *   更隐蔽的是它的**表现形式**：工具抛异常被兜住 → 回填"内部错误"给模型 →
+     *   模型转头对用户说"系统出了点内部错误，您稍后再试"。
+     *   接口返回 200，回答听起来很自然，**看起来像正常的服务降级**，
+     *   完全看不出是权限上下文丢了。
+     *
+     * 修法：用 DelegatingSecurityContextExecutorService 包装，
+     * 让任务在提交时捕获当前线程的 SecurityContext，在执行线程里还原。
+     * 这样既保留了超时中断能力，又不丢身份 —— 工具层的安全设计才真正生效。
      */
-    private final ExecutorService executor = Executors.newCachedThreadPool(r -> {
-        Thread t = new Thread(r, "mall-ai-agent");
-        t.setDaemon(true);
-        return t;
-    });
+    private final ExecutorService executor = new DelegatingSecurityContextExecutorService(
+            Executors.newCachedThreadPool(r -> {
+                Thread t = new Thread(r, "mall-ai-agent");
+                t.setDaemon(true);
+                return t;
+            }));
 
     /**
      * 会话历史。key 由调用方传（前端可用一个随机的 sessionId）。
@@ -234,10 +253,30 @@ public class AiAgentController {
             long roundStart = System.currentTimeMillis();
 
             // ① 调模型（带上完整的工具清单和历史）
+            //
+            // ★★ 这里有一个**决定「手写」还是「框架代劳」的关键开关** ★★
+            //
+            // Spring AI 的 ChatModel 默认会**自己**执行工具调用：
+            //   调模型 → 拿到 tool_calls → 自己执行 → 把结果回填 → 再调模型 → …
+            // 直到模型给出最终答案，才把结果返回给你。
+            //
+            // 后果是：我们拿到的 assistantMessage 里 getToolCalls() 永远是空的，
+            // 循环里的「执行工具 / 回填 / 重复检测 / 轮次统计」全部不会执行 ——
+            // 表面上 Answer 看起来挺正常，实际是框架在背后跑完了一切。
+            // 这正是设计文档要避免的：「框架把循环封在里面，出问题时是黑盒」。
+            //
+            // 所以必须显式关掉它（internalToolExecutionEnabled=false）：
+            // 模型只负责「说要调什么」，执行权完全留在我们手里。
+            // 顺带的好处是，SecurityContext、超时中断、trace 记录都在我们掌控下。
+            DeepSeekChatOptions options = DeepSeekChatOptions.builder()
+                    .internalToolExecutionEnabled(false)
+                    .build();
+
             ChatResponse response = client.prompt()
                     .system(SYSTEM_PROMPT)
                     .messages(history)
                     .toolCallbacks(tools)
+                    .options(options)
                     .call()
                     .chatResponse();
 

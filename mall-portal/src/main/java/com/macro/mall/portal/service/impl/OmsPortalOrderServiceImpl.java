@@ -525,7 +525,15 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
 
     @Override
     public CommonPage<OmsOrderDetail> list(Integer status, Integer pageNum, Integer pageSize) {
-        if(status==-1){
+        // 【缺陷修复】原实现是 if(status==-1)：对 Integer 做 == 比较会触发**自动拆箱**，
+        // status 为 null 时直接抛 NullPointerException：
+        //   Cannot invoke "java.lang.Integer.intValue()" because "status" is null
+        // 而「不传 status」正是最自然的调用方式（用户首次进订单列表就是不带筛选），
+        // 所以只要调用方省略该参数，这个接口就必然 500。
+        // 原项目没暴露，是因为 Controller 层一直传了值（-1 表示全部）；
+        // 接入 AI 工具后传 null（不筛选）立刻炸了出来。
+        // 正确写法：先判 null 再比较。
+        if(status!=null && status==-1){
             status = null;
         }
         UmsMember member = memberService.getCurrentMember();

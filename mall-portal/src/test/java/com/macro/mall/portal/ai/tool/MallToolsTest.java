@@ -63,6 +63,7 @@ class MallToolsTest {
     private UmsMemberService memberService;
     private PmsSkuStockMapper skuStockMapper;
     private PmsProductMapper productMapper;
+    private com.macro.mall.mapper.OmsOrderMapper orderMapper;
     private MallTools tools;
 
     /** 当前登录会员 —— 身份 mock 的锚点。 */
@@ -77,6 +78,7 @@ class MallToolsTest {
         memberService = mock(UmsMemberService.class);
         skuStockMapper = mock(PmsSkuStockMapper.class);
         productMapper = mock(PmsProductMapper.class);
+        orderMapper = mock(com.macro.mall.mapper.OmsOrderMapper.class);
 
         UmsMember member = new UmsMember();
         member.setId(CURRENT_MEMBER_ID);
@@ -84,7 +86,7 @@ class MallToolsTest {
         when(memberService.getCurrentMember()).thenReturn(member);
 
         tools = new MallTools(orderService, productService, memberService,
-                skuStockMapper, productMapper);
+                skuStockMapper, productMapper, orderMapper);
     }
 
     // ==================================================================
@@ -112,7 +114,8 @@ class MallToolsTest {
     void getOrderDetail_rejectsOtherMembersOrder() {
         // 该订单真实存在，但属于别人
         OmsOrder othersOrder = buildRawOrder(200L, OTHER_MEMBER_ID, "202610200101000099");
-        when(orderService.getOrderByOrderSn("202610200101000099")).thenReturn(othersOrder);
+        when(orderMapper.selectByExample(any(com.macro.mall.model.OmsOrderExample.class)))
+                .thenReturn(Collections.singletonList(othersOrder));
 
         ToolResult<com.macro.mall.portal.ai.domain.OrderDetailView> r =
                 tools.getOrderDetail("202610200101000099");
@@ -130,7 +133,8 @@ class MallToolsTest {
     @DisplayName("getOrderDetail 查自己的订单正常返回")
     void getOrderDetail_acceptsOwnOrder() {
         OmsOrder mine = buildRawOrder(100L, CURRENT_MEMBER_ID, "202610200101000001");
-        when(orderService.getOrderByOrderSn("202610200101000001")).thenReturn(mine);
+        when(orderMapper.selectByExample(any(com.macro.mall.model.OmsOrderExample.class)))
+                .thenReturn(Collections.singletonList(mine));
         OmsOrderDetail detail = new OmsOrderDetail();
         detail.setOrderItemList(Collections.singletonList(buildItem("华为 HUAWEI P20", 3)));
         when(orderService.detail(100L)).thenReturn(detail);
@@ -141,6 +145,29 @@ class MallToolsTest {
         assertTrue(r.isSuccess());
         assertTrue(r.getData().getProductNames().contains("华为 HUAWEI P20"));
         assertTrue(r.getData().getProductNames().contains("3"));
+    }
+
+    @Test
+    @DisplayName("查已发货/已完成的订单也要能查到（不能复用只查待付款的 getOrderByOrderSn）")
+    void getOrderDetail_findsNonPendingOrder() {
+        // 一笔已发货(status=2)的订单 —— 这是真机验证时暴露的问题：
+        // 之前复用 orderService.getOrderByOrderSn，它内部带 andStatusEqualTo(0)，
+        // 只查待付款单，导致「有订单却查不到详情」。
+        OmsOrder shipped = buildRawOrder(300L, CURRENT_MEMBER_ID, "202610200101000077");
+        shipped.setStatus(2);
+        when(orderMapper.selectByExample(any(com.macro.mall.model.OmsOrderExample.class)))
+                .thenReturn(Collections.singletonList(shipped));
+        OmsOrderDetail d = new OmsOrderDetail();
+        d.setOrderItemList(Collections.singletonList(buildItem("小米8", 1)));
+        when(orderService.detail(300L)).thenReturn(d);
+
+        ToolResult<com.macro.mall.portal.ai.domain.OrderDetailView> r =
+                tools.getOrderDetail("202610200101000077");
+
+        assertTrue(r.isSuccess(), "已发货订单必须能查到，实际：" + r.getMessage());
+        assertEquals("已发货", r.getData().getStatusText());
+        // 关键：不能再依赖那个带 status=0 的方法
+        verify(orderService, never()).getOrderByOrderSn(anyString());
     }
 
     // ==================================================================
@@ -166,16 +193,31 @@ class MallToolsTest {
         assertTrue(r.getMessage().contains("13800138000"), "应回显错误输入，便于模型定位");
         assertTrue(r.getMessage().contains("queryMyOrders"), "应给出退路");
         // 关键：格式不对就不该查库，避免无谓的数据库访问
-        verify(orderService, never()).getOrderByOrderSn(anyString());
+        verify(orderMapper, never()).selectByExample(any(com.macro.mall.model.OmsOrderExample.class));
     }
 
     @Test
     @DisplayName("订单号不存在时，提示要引导模型去列订单，而不是让它重复猜")
     void getOrderDetail_notFound_guidesToQueryMyOrders() {
-        when(orderService.getOrderByOrderSn(anyString())).thenReturn(null);
+        when(orderMapper.selectByExample(any(com.macro.mall.model.OmsOrderExample.class)))
+                .thenReturn(Collections.emptyList());
         ToolResult<?> r = tools.getOrderDetail("202610200101999999");
         assertFalse(r.isSuccess());
         assertTrue(r.getMessage().contains("queryMyOrders"));
+    }
+
+    @Test
+    @DisplayName("不传 status 时必须传 -1 给 Service（避免 Service 侧的拆箱 NPE）")
+    void queryMyOrders_passesMinusOneWhenStatusNull() {
+        when(orderService.list(any(), anyInt(), anyInt()))
+                .thenReturn(pageOf(Collections.emptyList()));
+
+        tools.queryMyOrders(null);
+
+        // OmsPortalOrderServiceImpl.list 的历史实现是 if(status==-1)，
+        // 传 null 会触发自动拆箱 NPE（Cannot invoke "Integer.intValue()" because "status" is null）。
+        // 该缺陷已修，但工具层仍显式传 -1 做双重保险 —— 这行断言把它钉死。
+        verify(orderService).list(org.mockito.ArgumentMatchers.eq(-1), anyInt(), anyInt());
     }
 
     // ==================================================================

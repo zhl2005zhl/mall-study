@@ -77,6 +77,8 @@ public class MallTools {
     private static final int ORDER_SN_LENGTH = 18;
 
     private final OmsPortalOrderService orderService;
+    /** 用于按 orderSn 查订单（不受 status 限制）—— getOrderByOrderSn 只查待付款单，不能复用。 */
+    private final com.macro.mall.mapper.OmsOrderMapper orderMapper;
     private final PmsPortalProductService productService;
     private final UmsMemberService memberService;
     private final PmsSkuStockMapper skuStockMapper;
@@ -86,12 +88,14 @@ public class MallTools {
                      PmsPortalProductService productService,
                      UmsMemberService memberService,
                      PmsSkuStockMapper skuStockMapper,
-                     PmsProductMapper productMapper) {
+                     PmsProductMapper productMapper,
+                     com.macro.mall.mapper.OmsOrderMapper orderMapper) {
         this.orderService = orderService;
         this.productService = productService;
         this.memberService = memberService;
         this.skuStockMapper = skuStockMapper;
         this.productMapper = productMapper;
+        this.orderMapper = orderMapper;
     }
 
     // ==================================================================
@@ -127,7 +131,13 @@ public class MallTools {
 
             // 复用已有 Service 分页查询。pageSize 用固定值而非让模型传，
             // 避免模型传 size=1000 把上下文撑爆。
-            CommonPage<OmsOrderDetail> page = orderService.list(status, 1, MAX_ORDER_RESULT);
+            //
+            // ★ 传 -1 而不是 null：OmsPortalOrderServiceImpl.list 的历史实现
+            //   是 if(status==-1)，null 会触发自动拆箱 NPE（该缺陷已一并修掉）。
+            //   但工具层不该依赖"上游已经修好了"——这里显式传 -1（表示全部状态），
+            //   与 Service 的既有约定一致，双重保险。
+            Integer queryStatus = (status == null) ? -1 : status;
+            CommonPage<OmsOrderDetail> page = orderService.list(queryStatus, 1, MAX_ORDER_RESULT);
             List<OmsOrderDetail> orderList = page == null ? null : page.getList();
 
             if (orderList == null || orderList.isEmpty()) {
@@ -206,7 +216,18 @@ public class MallTools {
                 return ToolResult.error("当前未登录，无法查询订单。请先登录。");
             }
 
-            OmsOrder order = orderService.getOrderByOrderSn(sn);
+            // ★ 这里**不能用** orderService.getOrderByOrderSn(sn)。
+            //
+            // 踩过的坑（真机验证暴露，单测抓不到）：
+            //   那个方法内部带了 .andStatusEqualTo(0)，它只查「待付款」订单 ——
+            //   因为它的原始用途是**支付回调**（要判断"这单还没付，可以付"）。
+            //   工具如果复用它，查已发货/已完成的订单会全部返回 null，
+            //   表现就是"我明明有 10 个订单，查详情却一个都查不到"。
+            //   更糟的是错误提示写的是"订单号可能有误"，把排查方向带偏。
+            //
+            // 所以工具层要自己按 orderSn 查询，且**不加 status 条件**。
+            // 这与 AlipayServiceImpl:183 的做法一致（它也是查任意状态的订单）。
+            OmsOrder order = findByOrderSnAnyStatus(sn);
             if (order == null) {
                 return ToolResult.error(
                         "没有找到订单号为 " + sn + " 的订单。"
@@ -449,6 +470,24 @@ public class MallTools {
                 + safe(order.getReceiverDetailAddress()));
 
         return v;
+    }
+
+    /**
+     * 按订单号查询订单，**不限状态**。
+     *
+     * 为什么不直接复用 OmsPortalOrderService.getOrderByOrderSn：
+     * 那个方法带了 andStatusEqualTo(0)，只查待付款订单（原始用途是支付回调）。
+     * 工具需要查任意状态的订单，因此独立实现。
+     *
+     * 同时过滤 delete_status=0（只看未删除的），与项目惯例一致。
+     */
+    private OmsOrder findByOrderSnAnyStatus(String orderSn) {
+        com.macro.mall.model.OmsOrderExample example = new com.macro.mall.model.OmsOrderExample();
+        example.createCriteria()
+                .andOrderSnEqualTo(orderSn)
+                .andDeleteStatusEqualTo(0);
+        List<OmsOrder> list = orderMapper.selectByExample(example);
+        return (list == null || list.isEmpty()) ? null : list.get(0);
     }
 
     /** 计算商品的可用库存总和：Σ (stock - lock_stock)。 */

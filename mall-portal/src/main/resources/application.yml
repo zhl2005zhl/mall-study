@@ -3,6 +3,19 @@ spring:
     name: mall-portal
   profiles:
     active: dev #默认为开发环境
+  # 始终排除 Spring AI 的 ChatClient 自动配置。
+  #
+  # 为什么要排除：ChatClientAutoConfiguration 会**无条件**创建 ChatClient.Builder，
+  # 而它依赖 ChatModel。没配 Key 时 ChatModel 不存在，于是每次请求 /ai/** 都会抛
+  # NoSuchBeanDefinitionException，被全局异常处理成 401 —— 看起来像鉴权失败，
+  # 实际是 bean 缺失，排查方向会被带偏很远（日志里能看到 "checking username:test"
+  # 却看不到 "authenticated user"，极具误导性）。
+  #
+  # 配了 Key 时也不需要它：ApiAgentController 里用 ChatClient.create(chatModel)
+  # 手动构建，等价于自动配置的产物，还少一层隐式依赖。
+  autoconfigure:
+    exclude:
+      - org.springframework.ai.model.chat.client.autoconfigure.ChatClientAutoConfiguration
   mvc:
     pathmatch:
       matching-strategy: ant_path_matcher
@@ -19,6 +32,33 @@ spring:
         # 关键：重试耗尽后不要重新入队，否则消息会在队列里无限循环把队列堵死。
         # 设为 false 后，被拒绝的消息会按队列配置的 x-dead-letter-exchange 进死信队列。
         default-requeue-rejected: false
+
+  # ============================ AI 能力配置 ============================
+  # 模型：DeepSeek（Spring AI 1.1.0 starter）
+  # Key 的给法，优先级从高到低：
+  #   1. 环境变量 DEEPSEEK_API_KEY（推荐，不落盘）
+  #   2. 启动参数 --spring.ai.deepseek.api-key=sk-xxx（临时验证用）
+  # ★ 绝不把真实 Key 写进本文件 —— 本文件是入库的
+  #
+  # 为什么这里不写 SpEL 自动推断：试过 ${...#{...'none' : 'deepseek'}}，
+  # SnakeYAML 会把三元里的 ": " 当成键值分隔符，直接解析失败（mapping values are not allowed here）。
+  # 改用最朴素的方式：值留空，由 AI_CHAT_PROVIDER 显式指定（不设时默认 none）。
+  # 想启用 AI：   set AI_CHAT_PROVIDER=deepseek  再设 DEEPSEEK_API_KEY
+  # 不设这两个变量 → AI 关闭，其它功能完全正常。
+  ai:
+    model:
+      chat: ${AI_CHAT_PROVIDER:none}
+    deepseek:
+      api-key: ${DEEPSEEK_API_KEY:}
+      base-url: https://api.deepseek.com
+      chat:
+        options:
+          model: deepseek-chat      # 对话/工具调用模型
+          temperature: 0.3          # 偏低：查订单类任务要稳定，不需要发挥
+          max-tokens: 2048
+
+# 没配模型时，把 ChatClient 自动配置一并排除（否则它会因缺 ChatModel 而让请求 500/401）。
+# 配了模型时这一行不起作用 —— 由下面的 SpEL 判断决定。
 
 mybatis:
   mapper-locations:
@@ -105,3 +145,15 @@ rabbitmq:
     name:
       cancelOrder: cancelOrderQueue
 
+
+# Agent 运行时参数（手写循环用）
+mall:
+  ai:
+    agent:
+      enabled: true
+      # 硬上限：防止模型陷入循环反复调工具，账单和延迟一起失控
+      max-rounds: 6
+      # 整体耗时上限（秒）
+      timeout-seconds: 120
+      # 滑动窗口：只保留最近 N 条消息
+      max-history-messages: 20

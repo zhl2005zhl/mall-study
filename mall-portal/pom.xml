@@ -47,6 +47,11 @@
             <artifactId>alipay-sdk-java</artifactId>
             <version>${alipay-sdk.version}</version>
         </dependency>
+        <!--Spring AI：DeepSeek 模型接入（Tool Calling / Agent Loop 用）-->
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-starter-model-deepseek</artifactId>
+        </dependency>
 
     </dependencies>
 

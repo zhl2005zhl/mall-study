@@ -25,3 +25,21 @@ docs/*.log
 # 2026-10-19 加入 —— dsh / 编码代理会在会话开始前自动读取它
 # ============================================================
 AGENTS.local.md
+
+# ============================================================
+# AI 相关密钥 —— 绝不入库（简历项目的头号翻车点）
+# 2026-10-20 加入 —— 接入 DeepSeek 前先把口子堵上
+# 一旦 Key 被推上 GitHub，会被爬虫在几分钟内抓走并盗刷；
+# 而且即使事后删除文件，git 历史里依然查得到，必须 rewrite 历史才能清干净。
+# ============================================================
+.env
+.env.*
+!.env.example
+application-local.yml
+application-local.yaml
+application-local.properties
+**/application-local.yml
+**/application-local.yaml
+# Spring AI 的 Key 也可能写在任意 profile 覆盖文件里
+**/application-secret*.yml
+**/application-secret*.properties

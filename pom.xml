@@ -48,6 +48,10 @@
         <aliyun-oss.version>3.18.5</aliyun-oss.version>
         <alipay-sdk.version>4.40.630.ALL</alipay-sdk.version>
         <logstash-logback.version>8.0</logstash-logback.version>
+        <!-- Spring AI 1.1.0 依赖 Spring Boot 3.5.x（其 autoconfigure 以 3.5.7 为基线），
+             与本项目的 3.5.14 同属 3.5 线。
+             切勿升到 2.0.0 —— 那条线依赖 Spring Boot 4.1.0，会和 3.5.14 直接冲突。 -->
+        <spring-ai.version>1.1.0</spring-ai.version>
         <minio.version>8.6.0</minio.version>
         <okhttp3.version>5.1.0</okhttp3.version>
         <mall-common.version>1.0-SNAPSHOT</mall-common.version>
@@ -89,6 +93,14 @@
 
     <dependencyManagement>
         <dependencies>
+            <!--Spring AI BOM：统一管理 AI 相关构件版本，避免与 Boot 3.5.x 冲突-->
+            <dependency>
+                <groupId>org.springframework.ai</groupId>
+                <artifactId>spring-ai-bom</artifactId>
+                <version>${spring-ai.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
             <!--mall通用模块-->
             <dependency>
                 <groupId>com.macro.mall</groupId>

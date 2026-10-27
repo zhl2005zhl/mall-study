@@ -1,6 +1,7 @@
 package com.macro.mall.portal.ai.agent;
 
 import com.macro.mall.common.api.CommonResult;
+import com.macro.mall.portal.ai.domain.AgentTrace;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import org.slf4j.Logger;
@@ -95,6 +96,15 @@ public class AiAgentController {
                比如提示订单号格式错误，就改用 queryMyOrders 拿正确的订单号，而不是重复调用。
             4. 拿到的数据里没有的信息，就直说没有，**绝不编造**订单号、金额、物流单号。
 
+            ## ★ 数据时效性（重要）
+            订单的状态、金额、物流都会随时间变化。你上一轮查到的数据**可能已经过时**。
+            因此：
+            - 当用户问的是「现在」的情况（如"多少钱""什么状态""到哪了""还有货吗"），
+              **必须重新调用工具确认**，不要直接复述前面几轮的查询结果。
+            - 只有在用户明确是在指代历史结论（如"刚才那个订单号是多少"）时，
+              才可以引用上文里已经得到的**静态信息**（订单号、下单时间、商品名）。
+            - 拿不准数据是否还准确时，宁可多查一次，也不要给出可能过时的数字。
+
             ## 回答风格
             - 用中文，简洁，像真人客服，不要输出 JSON 或 Markdown 表格。
             - 涉及金额要写清币种（元）。
@@ -105,6 +115,10 @@ public class AiAgentController {
     private final ObjectProvider<ToolCallbackProvider> toolCallbackProviders;
     private final ObjectProvider<com.macro.mall.portal.ai.tool.MallTools> mallToolsProvider;
     private final AgentProperties agentProperties;
+    /** trace 落盘（JSONL）。写失败不影响请求。 */
+    private final AgentTraceRecorder traceRecorder;
+    /** 当前使用的模型名，用于 trace 里横向对比成本。 */
+    private final String modelName;
 
     /**
      * 手动构建 ChatClient，不依赖 ChatClientAutoConfiguration。
@@ -160,11 +174,16 @@ public class AiAgentController {
     public AiAgentController(ChatModel chatModel,
                              ObjectProvider<ToolCallbackProvider> toolCallbackProviders,
                              ObjectProvider<com.macro.mall.portal.ai.tool.MallTools> mallToolsProvider,
-                             AgentProperties agentProperties) {
+                             AgentProperties agentProperties,
+                             AgentTraceRecorder traceRecorder,
+                             @org.springframework.beans.factory.annotation.Value(
+                                     "${spring.ai.deepseek.chat.options.model:deepseek-chat}") String modelName) {
         this.chatModel = chatModel;
         this.toolCallbackProviders = toolCallbackProviders;
         this.mallToolsProvider = mallToolsProvider;
         this.agentProperties = agentProperties;
+        this.traceRecorder = traceRecorder;
+        this.modelName = modelName;
         // ChatClient.create 是官方的编程式入口，效果等价于自动配置产出的 Bean
         this.chatClient = ChatClient.create(chatModel);
     }
@@ -240,10 +259,14 @@ public class AiAgentController {
 
         ChatClient client = this.chatClient;
 
-        // ---- trace：每轮记录 thought / action / observation ----
-        List<AgentStep> steps = new ArrayList<>();
+        // ---- trace：每轮记录 thought / action / observation + token ----
+        List<AgentTrace.Step> traceSteps = new ArrayList<>();
         // 重复调用检测：记录「工具名 + 参数」指纹
         Set<String> seenCalls = new HashSet<>();
+        // 历史裁剪次数 —— 用来观察上下文压力
+        int historyTrimCount = 0;
+        // 记录本次用的模型名，便于横向对比成本
+        String startModel = resolveModelName();
 
         String finalAnswer = null;
         String stopReason = null;
@@ -289,12 +312,22 @@ public class AiAgentController {
             AssistantMessage assistantMessage = generation.getOutput();
             history.add(assistantMessage);
 
+            // ★ token 计量：从响应元数据里取，取不到就当 0（EmptyUsage 会返回 0）
+            //   这是「量化成本」的唯一来源 —— 没有它，谈优化都是空话。
+            int roundPromptTokens = usagePrompt(response);
+            int roundCompletionTokens = usageCompletion(response);
+
             // ② 判断：模型是要调工具，还是给最终答案
             List<AssistantMessage.ToolCall> toolCalls = assistantMessage.getToolCalls();
             if (toolCalls == null || toolCalls.isEmpty()) {
                 finalAnswer = assistantMessage.getText();
-                steps.add(new AgentStep(round, truncate(assistantMessage.getText()),
-                        null, null, System.currentTimeMillis() - roundStart));
+                AgentTrace.Step step = new AgentTrace.Step();
+                step.setRound(round);
+                step.setThought(truncate(assistantMessage.getText()));
+                step.setElapsedMs(System.currentTimeMillis() - roundStart);
+                step.setPromptTokens(roundPromptTokens);
+                step.setCompletionTokens(roundCompletionTokens);
+                traceSteps.add(step);
                 stopReason = "正常结束";
                 break;
             }
@@ -315,19 +348,33 @@ public class AiAgentController {
                     observation = executeTool(tools, call);
                 }
 
-                toolResponses.add(new ToolResponseMessage.ToolResponse(
-                        call.id(), call.name(), observation));
+                // ★ 回填前做**字符级截断**：单条工具结果过长时，即便字段已经瘦身，
+                //   也可能因为条数多而变长（比如 10 个订单 × 每个几百字符）。
+                //   截断而不是丢弃：保留前面有用的部分，并在末尾注明被截断，
+                //   让模型知道"不是没有更多数据，而是显示上限到了"，
+                //   而不是以为自己看到的就是全部。
+                int rawLen = observation == null ? 0 : observation.length();
+                String shrunk = shrinkObservation(observation);
 
-                steps.add(new AgentStep(round, null,
-                        call.name() + "(" + truncate(call.arguments()) + ")",
-                        truncate(observation),
-                        System.currentTimeMillis() - roundStart));
+                toolResponses.add(new ToolResponseMessage.ToolResponse(
+                        call.id(), call.name(), shrunk));
+
+                AgentTrace.Step step = new AgentTrace.Step();
+                step.setRound(round);
+                step.setAction(call.name() + "(" + truncate(call.arguments()) + ")");
+                step.setObservation(truncate(shrunk));
+                step.setObservationChars(rawLen);
+                step.setElapsedMs(System.currentTimeMillis() - roundStart);
+                step.setPromptTokens(roundPromptTokens);
+                step.setCompletionTokens(roundCompletionTokens);
+                traceSteps.add(step);
             }
             history.add(ToolResponseMessage.builder().responses(toolResponses).build());
 
-            // ④ 滑动窗口：历史太长就丢掉最早的对话（保留 system 由 ChatClient 负责，
-            //    这里只裁剪 messages 列表本身）
-            trimHistory(history);
+            // ④ 历史裁剪：条数 + 字符数双重限制
+            if (trimHistory(history)) {
+                historyTrimCount++;
+            }
         }
 
         if (finalAnswer == null && stopReason == null) {
@@ -338,21 +385,111 @@ public class AiAgentController {
         }
 
         // ---- 保存历史（裁剪后）----
-        trimHistory(history);
+        if (trimHistory(history)) {
+            historyTrimCount++;
+        }
         sessionHistory.put(sessionId, history);
+
+        // ---- 汇总 trace ----
+        long costMs = System.currentTimeMillis() - startMs;
+        int promptTotal = traceSteps.stream().mapToInt(AgentTrace.Step::getPromptTokens).sum();
+        int completionTotal = traceSteps.stream().mapToInt(AgentTrace.Step::getCompletionTokens).sum();
+
+        AgentTrace trace = new AgentTrace();
+        trace.setTraceId(java.util.UUID.randomUUID().toString().substring(0, 8));
+        trace.setSessionId(sessionId);
+        trace.setQuestion(question);
+        trace.setAnswer(finalAnswer);
+        trace.setSteps(traceSteps);
+        trace.setRounds(round);
+        trace.setToolCallCount(traceSteps.stream().filter(s -> s.getAction() != null).count());
+        trace.setPromptTokens(promptTotal);
+        trace.setCompletionTokens(completionTotal);
+        trace.setTotalTokens(promptTotal + completionTotal);
+        trace.setCostMs(costMs);
+        trace.setStopReason(stopReason);
+        trace.setSuccess(finalAnswer != null);
+        trace.setHistoryTrimCount(historyTrimCount);
+        trace.setModel(startModel);
+
+        // 落盘（失败不影响请求）
+        traceRecorder.record(trace);
 
         AiChatResult result = new AiChatResult();
         result.setAnswer(finalAnswer);
         result.setSessionId(sessionId);
         result.setRounds(round);
-        result.setSteps(steps);
+        result.setSteps(trace.getSteps());
         result.setStopReason(stopReason);
-        result.setCostMs(System.currentTimeMillis() - startMs);
-        result.setToolCallCount(steps.stream().filter(s -> s.getAction() != null).count());
+        result.setCostMs(costMs);
+        result.setToolCallCount(trace.getToolCallCount());
+        // 成本与裁剪信息一并返回，便于前端/演示时展示
+        result.setTotalTokens(trace.getTotalTokens());
+        result.setPromptTokens(trace.getPromptTokens());
+        result.setCompletionTokens(trace.getCompletionTokens());
+        result.setHistoryTrimCount(historyTrimCount);
+        result.setTraceId(trace.getTraceId());
 
-        LOGGER.info("[AI Agent] 完成 sessionId={} 轮次={} 工具调用={} 耗时={}ms 终止原因={}",
-                sessionId, round, result.getToolCallCount(), result.getCostMs(), stopReason);
+        LOGGER.info("[AI Agent] 完成 traceId={} sessionId={} 轮次={} 工具调用={} "
+                        + "token={}(prompt={}/completion={}) 耗时={}ms 裁剪={}次 终止原因={}",
+                trace.getTraceId(), sessionId, round, result.getToolCallCount(),
+                trace.getTotalTokens(), promptTotal, completionTotal,
+                costMs, historyTrimCount, stopReason);
         return result;
+    }
+
+    /** 当前使用的模型名（构造时注入，trace 里用来对比成本）。 */
+    private String resolveModelName() {
+        return modelName;
+    }
+    /** 从响应中读 prompt token，取不到返回 0。 */
+    private int usagePrompt(ChatResponse response) {
+        try {
+            if (response.getMetadata() != null && response.getMetadata().getUsage() != null
+                    && response.getMetadata().getUsage().getPromptTokens() != null) {
+                return response.getMetadata().getUsage().getPromptTokens();
+            }
+        } catch (RuntimeException ignored) {
+            // 某些实现可能没有 usage，忽略
+        }
+        return 0;
+    }
+
+    /** 从响应中读 completion token，取不到返回 0。 */
+    private int usageCompletion(ChatResponse response) {
+        try {
+            if (response.getMetadata() != null && response.getMetadata().getUsage() != null
+                    && response.getMetadata().getUsage().getCompletionTokens() != null) {
+                return response.getMetadata().getUsage().getCompletionTokens();
+            }
+        } catch (RuntimeException ignored) {
+            // 同上
+        }
+        return 0;
+    }
+
+    /**
+     * 回填前的字符级截断。
+     *
+     * 与「字段瘦身」的分工：
+     *   字段瘦身（OrderSummary 等）解决的是「单条数据太宽」——30 个字段砍到 4 个。
+     *   这里解决的是「整体太长」——10 个订单 × 每个 300 字符 = 3000 字符，仍然可能过大。
+     *
+     * 为什么截断而不是直接丢弃：丢掉整条会让模型以为「没有数据」，
+     * 而截断 + 明确注明，模型能知道「数据还有，但被显示上限截住了」——
+     * 它可以据此决定「只查其中一条」而不是「报告查不到」。
+     */
+    private String shrinkObservation(String observation) {
+        if (observation == null) {
+            return "";
+        }
+        int max = agentProperties.getMaxObservationChars();
+        if (observation.length() <= max) {
+            return observation;
+        }
+        return observation.substring(0, max)
+                + "…（结果过长，此处截断，共 " + observation.length() + " 字符。"
+                + "如需完整信息，请缩小查询范围，例如指定单个订单号）";
     }
 
     /**
@@ -408,15 +545,30 @@ public class AiAgentController {
     }
 
     /**
-     * 滑动窗口裁剪。
+     * 历史裁剪：**条数 + 字符数**双重限制。
      *
-     * 注意：不能只按条数砍。tool 响应消息和它对应的 assistant(工具调用) 消息
-     * 是成对的 —— 砍掉了 assistant 却留下 tool 响应，很多模型会直接报 400。
-     * 所以这里按「从前往后整段丢」的方式，每次丢到下一个 UserMessage 开头。
+     * ============================ 为什么两个限制都要有 ============================
+     * 只按条数（原来的实现）有个致命盲区：一条 tool 响应可能几万字符。
+     * 「20 条消息」听起来很少，但如果其中 10 条是工具结果，照样能到几十万字符、
+     * 直接超出上下文窗口。**真正的成本瓶颈是字符/token 数，不是条数。**
+     *
+     * 所以两种限制分工明确：
+     *   条数 → 防止「碎消息」堆积（很多轮短对话）
+     *   字符 → 防止「单条巨无霸」（一次返回大批数据）
+     *
+     * ============================ 为什么整段丢，不逐条丢 ============================
+     * assistant(工具调用) 和 tool(工具结果) 是**成对**的。
+     * 砍掉 assistant 却留下 tool 响应，多数模型会直接 400（消息顺序不合法）。
+     * 所以每次都丢到「下一个 UserMessage 开头」为止，保证成对关系完整。
+     *
+     * @return 是否真的发生了裁剪（用于统计上下文压力）
      */
-    private void trimHistory(List<Message> history) {
-        int max = agentProperties.getMaxHistoryMessages();
-        while (history.size() > max) {
+    private boolean trimHistory(List<Message> history) {
+        int maxMessages = agentProperties.getMaxHistoryMessages();
+        int maxChars = agentProperties.getMaxHistoryChars();
+        boolean trimmed = false;
+
+        while (needTrim(history, maxMessages, maxChars)) {
             int cut = -1;
             for (int i = 1; i < history.size(); i++) {
                 if (history.get(i) instanceof UserMessage) {
@@ -425,16 +577,57 @@ public class AiAgentController {
                 }
             }
             if (cut <= 0) {
-                // 找不到安全的截断点（说明只有一条用户消息 + 一堆工具往返），
-                // 那就只保留第一条用户消息，避免消息成对关系被破坏
-                Message first = history.get(0);
-                history.clear();
-                history.add(first);
-                // 但第一条如果是 User 之后紧跟 tool 往返，答案会丢；
-                // 这里让它自然结束，由下一次循环重新累积
+                // 找不到安全的截断点：说明只剩「一条用户消息 + 一堆工具往返」，
+                // 再丢就会破坏成对关系。保留第一条，让它自然结束。
                 break;
             }
             history.subList(0, cut).clear();
+            trimmed = true;
+        }
+        return trimmed;
+    }
+
+    /** 判断是否需要裁剪。 */
+    private boolean needTrim(List<Message> history, int maxMessages, int maxChars) {
+        if (history.size() > maxMessages) {
+            return true;
+        }
+        long chars = 0;
+        for (Message m : history) {
+            chars += messageLength(m);
+        }
+        return chars > maxChars;
+    }
+
+    /**
+     * 估算一条消息的字符数。
+     *
+     * 为什么要估算而不是精确统计 token：token 数要模型侧才准，
+     * 本地只能拿字符数做近似（中文约 1 字符 ≈ 1 token，英文约 4 字符 ≈ 1 token）。
+     * 作为**上限保护**，字符数这个粗粒度信号完全够用 —— 目标是「别爆」，不是「精确计费」。
+     */
+    private int messageLength(Message m) {
+        if (m == null) {
+            return 0;
+        }
+        try {
+            String text = m.getText();
+            int len = text == null ? 0 : text.length();
+            // ToolResponseMessage 的正文在 responses 里，getText() 取不到，
+            // 这里按 responses 的数量做个保守估算
+            if (m instanceof ToolResponseMessage) {
+                ToolResponseMessage trm = (ToolResponseMessage) m;
+                if (trm.getResponses() != null) {
+                    for (ToolResponseMessage.ToolResponse r : trm.getResponses()) {
+                        if (r.responseData() != null) {
+                            len += r.responseData().length();
+                        }
+                    }
+                }
+            }
+            return len;
+        } catch (RuntimeException e) {
+            return 0;
         }
     }
 
@@ -490,7 +683,7 @@ public class AiAgentController {
         /** 实际走了几轮。 */
         private int rounds;
         /** 每轮的动作记录 —— 这就是可观测性的产物。 */
-        private List<AgentStep> steps;
+        private List<AgentTrace.Step> steps;
         /** 终止原因：正常结束 / 达到最大轮次 / 前置条件不满足。 */
         private String stopReason;
         /** 总耗时（毫秒）。 */
@@ -498,56 +691,41 @@ public class AiAgentController {
         /** 工具调用总次数。 */
         private Long toolCallCount;
 
+        /** 本次消耗的总 token（prompt + completion）。 */
+        private Integer totalTokens;
+        private Integer promptTokens;
+        private Integer completionTokens;
+        /** 历史被裁剪的次数，用于观察上下文压力。 */
+        private Integer historyTrimCount;
+        /** trace id，可与落盘的 JSONL 对应。 */
+        private String traceId;
+
         public String getAnswer() { return answer; }
         public void setAnswer(String answer) { this.answer = answer; }
         public String getSessionId() { return sessionId; }
         public void setSessionId(String sessionId) { this.sessionId = sessionId; }
         public int getRounds() { return rounds; }
         public void setRounds(int rounds) { this.rounds = rounds; }
-        public List<AgentStep> getSteps() { return steps; }
-        public void setSteps(List<AgentStep> steps) { this.steps = steps; }
+        public List<AgentTrace.Step> getSteps() { return steps; }
+        public void setSteps(List<AgentTrace.Step> steps) { this.steps = steps; }
         public String getStopReason() { return stopReason; }
         public void setStopReason(String stopReason) { this.stopReason = stopReason; }
         public Long getCostMs() { return costMs; }
         public void setCostMs(Long costMs) { this.costMs = costMs; }
         public Long getToolCallCount() { return toolCallCount; }
         public void setToolCallCount(Long toolCallCount) { this.toolCallCount = toolCallCount; }
+        public Integer getTotalTokens() { return totalTokens; }
+        public void setTotalTokens(Integer totalTokens) { this.totalTokens = totalTokens; }
+        public Integer getPromptTokens() { return promptTokens; }
+        public void setPromptTokens(Integer promptTokens) { this.promptTokens = promptTokens; }
+        public Integer getCompletionTokens() { return completionTokens; }
+        public void setCompletionTokens(Integer completionTokens) { this.completionTokens = completionTokens; }
+        public Integer getHistoryTrimCount() { return historyTrimCount; }
+        public void setHistoryTrimCount(Integer historyTrimCount) { this.historyTrimCount = historyTrimCount; }
+        public String getTraceId() { return traceId; }
+        public void setTraceId(String traceId) { this.traceId = traceId; }
     }
 
-    /**
-     * 单轮执行记录。thought / action / observation 是 ReAct 的三要素，
-     * 也是调试 Agent 唯一有效的手段。
-     */
-    public static class AgentStep {
-        private int round;
-        /** 模型的推理/文本输出。 */
-        private String thought;
-        /** 调用了哪个工具、参数是什么。 */
-        private String action;
-        /** 工具返回了什么（瘦身后）。 */
-        private String observation;
-        private Long elapsedMs;
-
-        public AgentStep() {
-        }
-
-        public AgentStep(int round, String thought, String action, String observation, Long elapsedMs) {
-            this.round = round;
-            this.thought = thought;
-            this.action = action;
-            this.observation = observation;
-            this.elapsedMs = elapsedMs;
-        }
-
-        public int getRound() { return round; }
-        public void setRound(int round) { this.round = round; }
-        public String getThought() { return thought; }
-        public void setThought(String thought) { this.thought = thought; }
-        public String getAction() { return action; }
-        public void setAction(String action) { this.action = action; }
-        public String getObservation() { return observation; }
-        public void setObservation(String observation) { this.observation = observation; }
-        public Long getElapsedMs() { return elapsedMs; }
-        public void setElapsedMs(Long elapsedMs) { this.elapsedMs = elapsedMs; }
-    }
+    // 单轮记录统一使用 AgentTrace.Step（见 ai/domain/AgentTrace.java），
+    // 不再在这里维护一份重复结构 —— 两份结构迟早会漂移。
 }

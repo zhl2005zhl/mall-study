@@ -157,3 +157,15 @@ mall:
       timeout-seconds: 120
       # 滑动窗口：只保留最近 N 条消息
       max-history-messages: 20
+      # 历史字符数上限 —— 比条数更关键：一条 tool 响应可能几万字符，
+      # 「20 条」听起来不多，若其中有 10 条工具结果照样能撑爆窗口。
+      # 真正的成本瓶颈是字符/token 数，不是条数。
+      max-history-chars: 40000
+      # 单条工具结果回填给模型时的字符上限（超出截断并注明）
+      max-observation-chars: 6000
+      # 是否把 trace 落盘成 JSONL（一行一条，便于 jq / pandas 分析）
+      trace-enabled: true
+      # trace 目录：放 logs 下，不进版本库（含用户问题与订单信息，属数据不属代码）
+      trace-dir: logs/ai-trace
+      # 是否把 trace 一并返回给调用方（演示/面试时可看完整执行路径）
+      expose-trace: true

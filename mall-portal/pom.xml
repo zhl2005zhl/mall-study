@@ -52,6 +52,24 @@
             <groupId>org.springframework.ai</groupId>
             <artifactId>spring-ai-starter-model-deepseek</artifactId>
         </dependency>
+        <!--
+          MCP Server（第 4 步）：把 MallTools 的能力用 MCP 协议暴露出去，
+          任何支持 MCP 的客户端（Claude Desktop、各类 IDE 插件）都能直接调用。
+
+          为什么选 webmvc 版而不是 webflux 版：
+            本项目是 Spring MVC + Tomcat 的同步栈。webflux starter 会拉进
+            webflux 依赖，和现有的 MVC 栈混在一起容易出现「两种 Web 栈共存」的
+            隐式问题（拦截器行为、线程模型都不一样）。
+            webmvc 版直接复用现有 servlet 容器，零额外运行时成本。
+
+          为什么放进 mall-portal 而不是单独建模块：
+            MCP 暴露的就是 MallTools 那 4 个工具，而工具依赖 portal 的 Service
+            与 SecurityContext。单独建模块就要把这两样都抽出去，成本远大于收益。
+        -->
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-starter-mcp-server-webmvc</artifactId>
+        </dependency>
 
     </dependencies>
 

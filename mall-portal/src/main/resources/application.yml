@@ -56,6 +56,17 @@ spring:
           model: deepseek-chat      # 对话/工具调用模型
           temperature: 0.3          # 偏低：查订单类任务要稳定，不需要发挥
           max-tokens: 2048
+    # ---- MCP Server（第 4 步）：把商品类工具用 MCP 协议暴露 ----
+    # protocol=STREAMABLE：SSE 在 Spring AI 2.0 已标记 deprecated，
+    # STREAMABLE 是替代者，同样基于 HTTP，更适合无状态部署。
+    # 不配 protocol 时 MCP Server 不启动（McpServerConfig 用 @ConditionalOnProperty 守卫），
+    # 这样『不想要 MCP』的用户只要不配这一项即可，零副作用。
+    mcp:
+      server:
+        name: mall-product-mcp
+        version: 1.0.0
+        protocol: ${MCP_PROTOCOL:STREAMABLE}
+        type: SYNC
 
 # 没配模型时，把 ChatClient 自动配置一并排除（否则它会因缺 ChatModel 而让请求 500/401）。
 # 配了模型时这一行不起作用 —— 由下面的 SpEL 判断决定。
@@ -106,6 +117,15 @@ secure:
       # 「有意」不放行 —— 它们必须绑定"是谁"
       - /seckill/current
       - /seckill/products
+      # ---- MCP 端点（第 4 步）----
+      # 必须放行给 Spring Security：MCP 客户端是外部程序（Claude Desktop / IDE 插件），
+      # 不走 mall 的 JWT 登录，拿不到 Bearer token。
+      #
+      # ★ 放行 ≠ 无鉴权：鉴权改由 McpAuthFilter 在 HTTP 层用共享密钥完成
+      #   （请求头 X-MCP-Token，常量时间比较，未配密钥则 fail-closed 拒绝一切）。
+      #   这是一种「换一套更合适的鉴权方式」，而不是「取消鉴权」。
+      - /mcp
+      - /mcp/**
 
 springdoc:
   swagger-ui:
@@ -169,3 +189,12 @@ mall:
       trace-dir: logs/ai-trace
       # 是否把 trace 一并返回给调用方（演示/面试时可看完整执行路径）
       expose-trace: true
+    # ============================ MCP Server 配置（第 4 步）============================
+    # 把商品类只读工具用 MCP 协议暴露出去，任何支持 MCP 的客户端都能调用。
+    # 为什么不暴露订单类工具：MCP 外部调用没有 SecurityContext，
+    # 要查订单就只能让调用方传 memberId —— 那等于把身份交给对方指定，
+    # 正是前面花大力气堵上的水平越权。所以 MCP 只开放公开的商品数据。
+    mcp:
+      # 共享密钥（请求头 X-MCP-Token）。**留空则整个 MCP 端点拒绝服务**（fail-closed），
+      # 这是有意的：『忘了配』不应该导致端口对全世界敞开。
+      auth-token: ${MCP_AUTH_TOKEN:}

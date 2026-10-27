@@ -71,6 +71,38 @@
             <artifactId>spring-ai-starter-mcp-server-webmvc</artifactId>
         </dependency>
 
+        <!--
+          ============================ RAG 相关依赖 ============================
+
+          RAG（检索增强生成）需要两样东西：把文本转向量的模型、存向量的库。
+
+          ① embedding 模型：Ollama + bge-m3
+             为什么不用 DeepSeek：它**不提供 embedding 接口**（实测 /embeddings 返回 404）。
+             为什么选 bge-m3：中文效果公认好（MTEB 中文榜前列），支持 100+ 语种、
+             8192 token 长文本，1.2GB 本地可跑、零 API 成本。
+
+          ② 向量库：Milvus
+             为什么不用项目已有的 ES：实测确认本机 ES 7.17.3 是 **basic 许可**，
+             不支持 kNN 检索（查询报 "Unknown key in [knn]"，_knn_search 端点也不存在）。
+             而 Spring AI 的 ES 向量库正是靠 kNN 实现，所以走不通。
+             （理论上能改用 script_score 暴力扫描，但那是 O(n)，数据量一大就废，
+               而且要多写一套适配代码 —— 不如直接用专业向量库。）
+
+             Milvus 支持 HNSW / IVF 等真 ANN 索引，且是 JD 里出现频率最高的向量库名字。
+
+          注：这两个 starter 都只在配置了对应地址时才生效（见 application.yml 的
+              spring.ai.ollama.base-url 与 spring.ai.vectorstore.milvus.client.host），
+              不配则 RAG 能力整体不启用，不影响已有功能。
+        -->
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-starter-model-ollama</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-starter-vector-store-milvus</artifactId>
+        </dependency>
+
     </dependencies>
 
     <build>

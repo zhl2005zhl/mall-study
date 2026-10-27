@@ -74,6 +74,12 @@ public class AgentTrace {
     /** 模型名，便于对比不同模型的成本。 */
     private String model;
 
+    /** RAG 检索命中的知识块数量（0 表示没检索到，或 RAG 未启用）。 */
+    private int ragHitCount;
+
+    /** 命中的知识块标题（用 | 连接），用于判断「检索对没对」。 */
+    private String ragTitles;
+
     /**
      * 单轮执行记录。
      *
@@ -147,4 +153,8 @@ public class AgentTrace {
     public void setHistoryTrimCount(int historyTrimCount) { this.historyTrimCount = historyTrimCount; }
     public String getModel() { return model; }
     public void setModel(String model) { this.model = model; }
+    public int getRagHitCount() { return ragHitCount; }
+    public void setRagHitCount(int ragHitCount) { this.ragHitCount = ragHitCount; }
+    public String getRagTitles() { return ragTitles; }
+    public void setRagTitles(String ragTitles) { this.ragTitles = ragTitles; }
 }

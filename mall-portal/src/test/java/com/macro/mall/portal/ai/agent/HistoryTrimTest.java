@@ -41,8 +41,14 @@ class HistoryTrimTest {
         // 用 Mock 的 ChatModel 满足构造器断言（本测试不真正调模型，只用裁剪逻辑）
         org.springframework.ai.chat.model.ChatModel mockModel =
                 org.mockito.Mockito.mock(org.springframework.ai.chat.model.ChatModel.class);
+        // RAG 未启用时 KnowledgeRetriever 为 null，用 ObjectProvider 返回 null 模拟
+        @SuppressWarnings("unchecked")
+        org.springframework.beans.factory.ObjectProvider<
+                com.macro.mall.portal.ai.rag.KnowledgeRetriever> noRag =
+                org.mockito.Mockito.mock(org.springframework.beans.factory.ObjectProvider.class);
+        org.mockito.Mockito.when(noRag.getIfAvailable()).thenReturn(null);
         return new AiAgentController(mockModel, null, null, props,
-                new AgentTraceRecorder(null, props), "test-model");
+                new AgentTraceRecorder(null, props), noRag, "test-model");
     }
 
     private boolean invokeTrim(AiAgentController c, List<org.springframework.ai.chat.messages.Message> history)

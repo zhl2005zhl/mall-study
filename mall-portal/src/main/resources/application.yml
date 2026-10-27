@@ -67,6 +67,34 @@ spring:
         version: 1.0.0
         protocol: ${MCP_PROTOCOL:STREAMABLE}
         type: SYNC
+    # ---- Ollama：本地 embedding 模型（RAG 的向量化）----
+    # 为什么单独指定 base-url：Ollama 默认跑在 11434，
+    # 显式写出来便于将来换到别的机器或容器。
+    # 注意：Ollama 不可达时 embedding 会失败，但**不影响其他功能** ——
+    # KnowledgeRetriever 会把检索异常降级成「没检索到」。
+    ollama:
+      base-url: ${OLLAMA_BASE_URL:http://localhost:11434}
+      embedding:
+        options:
+          model: ${OLLAMA_EMBED_MODEL:bge-m3}
+
+    # ---- Milvus 向量库（RAG 的存储与检索）----
+    # 为什么不用项目已有的 ES：实测本机 ES 7.17.3 是 basic 许可，
+    # 不支持 kNN 检索（报 Unknown key in [knn]，_knn_search 端点也不存在），
+    # 而 Spring AI 的 ES 向量库正是靠 kNN 实现，走不通。
+    # Milvus 支持 HNSW/IVF 等真 ANN 索引，是 JD 里最常见的向量库。
+    vectorstore:
+      milvus:
+        client:
+          host: ${MILVUS_HOST:localhost}
+          port: ${MILVUS_PORT:19530}
+        database-name: ${MILVUS_DATABASE:default}
+        collection-name: ${MILVUS_COLLECTION:mall_knowledge}
+        # ★ 必须与实际 embedding 模型维度一致，否则写入会失败。
+        # bge-m3 输出 1024 维（实测确认见 docs；换模型必须同步改这里）
+        embedding-dimension: ${EMBEDDING_DIM:1024}
+        index-type: HNSW
+        metric-type: COSINE
 
 # 没配模型时，把 ChatClient 自动配置一并排除（否则它会因缺 ChatModel 而让请求 500/401）。
 # 配了模型时这一行不起作用 —— 由下面的 SpEL 判断决定。
@@ -198,3 +226,22 @@ mall:
       # 共享密钥（请求头 X-MCP-Token）。**留空则整个 MCP 端点拒绝服务**（fail-closed），
       # 这是有意的：『忘了配』不应该导致端口对全世界敞开。
       auth-token: ${MCP_AUTH_TOKEN:}
+
+    # ============================ RAG 配置（第 5 步）============================
+    # RAG = 检索增强生成：先把相关知识检索出来，再让模型带着资料回答。
+    # 解决的是「模型不知道你家具体规定」的问题 —— 客服政策这种私有知识，
+    # 模型训练时不可能见过，不查资料就只能编。
+    rag:
+      enabled: ${RAG_ENABLED:false}
+      # 启动时自动加载知识库到向量库（幂等：按标题 hash 覆盖，不会重复堆积）
+      load-on-startup: true
+      # 检索返回的知识块数量。不是越大越好：每块都进 prompt，
+      # topK 过大既涨成本，又会引入无关内容让模型编答案。
+      top-k: 3
+      # ★ 相似度阈值 —— RAG 效果的关键开关。
+      # 向量检索永远返回 topK 条（哪怕问「今天天气」也会硬找三条政策），
+      # 没有阈值模型就会拿无关内容硬编；设了阈值检索不到就返回空，
+      # 模型才能老实说「这个我不知道」。
+      similarity-threshold: 0.5
+      # 检索结果注进 prompt 的最大字符数
+      max-context-chars: 3000

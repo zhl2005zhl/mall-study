@@ -2,6 +2,7 @@ package com.macro.mall.portal.ai.agent;
 
 import com.macro.mall.common.api.CommonResult;
 import com.macro.mall.portal.ai.domain.AgentTrace;
+import com.macro.mall.portal.ai.rag.KnowledgeRetriever;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import org.slf4j.Logger;
@@ -117,6 +118,11 @@ public class AiAgentController {
     private final AgentProperties agentProperties;
     /** trace 落盘（JSONL）。写失败不影响请求。 */
     private final AgentTraceRecorder traceRecorder;
+    /**
+     * RAG 知识检索器。RAG 未启用时为 null（用 ObjectProvider 拿，允许缺失）。
+     * 为 null 时走「无知识库」路径，不影响工具调用能力。
+     */
+    private final com.macro.mall.portal.ai.rag.KnowledgeRetriever knowledgeRetriever;
     /** 当前使用的模型名，用于 trace 里横向对比成本。 */
     private final String modelName;
 
@@ -176,6 +182,7 @@ public class AiAgentController {
                              ObjectProvider<com.macro.mall.portal.ai.tool.MallTools> mallToolsProvider,
                              AgentProperties agentProperties,
                              AgentTraceRecorder traceRecorder,
+                             ObjectProvider<com.macro.mall.portal.ai.rag.KnowledgeRetriever> retrieverProvider,
                              @org.springframework.beans.factory.annotation.Value(
                                      "${spring.ai.deepseek.chat.options.model:deepseek-chat}") String modelName) {
         this.chatModel = chatModel;
@@ -184,6 +191,10 @@ public class AiAgentController {
         this.agentProperties = agentProperties;
         this.traceRecorder = traceRecorder;
         this.modelName = modelName;
+        // 用 ObjectProvider 而不是直接注入：RAG 未启用（没配 Milvus/Ollama）时
+        // KnowledgeRetriever 这个 Bean 根本不存在，直接注入会导致启动失败。
+        // 用 Provider 拿到 null，走"无知识库"路径 —— RAG 是增强能力，不该成为硬依赖。
+        this.knowledgeRetriever = retrieverProvider.getIfAvailable();
         // ChatClient.create 是官方的编程式入口，效果等价于自动配置产出的 Bean
         this.chatClient = ChatClient.create(chatModel);
     }
@@ -252,6 +263,23 @@ public class AiAgentController {
             return failResult(question, "没有可用的查询工具，无法完成数据查询类问题。");
         }
 
+        // ---- ★ RAG 检索：先查资料，再让模型带着资料回答 ----
+        //
+        // 顺序很重要：**检索发生在第一轮模型调用之前**，而不是让模型"决定要不要查知识库"。
+        // 因为知识库问答是「无状态的一次性检索」，没有多轮价值：
+        //   - 用户问「能退货吗」→ 检索一次政策就够，不需要模型自己规划
+        //   - 让模型调工具去查，反而多一轮开销，还容易漏查
+        // 这跟订单查询不同（那个需要按用户意图分步：先列订单、再查详情）。
+        //
+        // 检索不到时 knowledgeContext 为空，模型会走"没有知识库"的路径，
+        // 而不是拿到一堆无关内容硬编 —— 这就是 similarityThreshold 的意义。
+        String knowledgeContext = "";
+        List<com.macro.mall.portal.ai.rag.KnowledgeRetriever.RetrievedChunk> chunks = new ArrayList<>();
+        if (knowledgeRetriever != null) {
+            chunks = knowledgeRetriever.retrieve(question);
+            knowledgeContext = knowledgeRetriever.buildContext(chunks);
+        }
+
         // ---- 组装历史（带滑动窗口）----
         List<Message> history = new ArrayList<>(
                 sessionHistory.getOrDefault(sessionId, new ArrayList<>()));
@@ -295,8 +323,17 @@ public class AiAgentController {
                     .internalToolExecutionEnabled(false)
                     .build();
 
+            // system prompt 拼上 RAG 检索到的知识（如果有）。
+            // 为什么放 system 而不是塞进 user 消息：
+            //   system 是"角色设定 + 参考资料"的正确位置，模型会把它当权威背景；
+            //   塞进 user 消息会和用户的实际提问混在一起，模型容易分不清
+            //   「这是用户说的」还是「这是系统给的资料」。
+            String systemWithKb = knowledgeContext.isEmpty()
+                    ? SYSTEM_PROMPT
+                    : SYSTEM_PROMPT + "\n\n" + knowledgeContext;
+
             ChatResponse response = client.prompt()
-                    .system(SYSTEM_PROMPT)
+                    .system(systemWithKb)
                     .messages(history)
                     .toolCallbacks(tools)
                     .options(options)
@@ -411,6 +448,13 @@ public class AiAgentController {
         trace.setSuccess(finalAnswer != null);
         trace.setHistoryTrimCount(historyTrimCount);
         trace.setModel(startModel);
+        // 记录 RAG 检索情况：命中几块、命中了哪些标题。
+        // 这是评估 RAG 效果最直接的依据 —— 回答不准时要先分清是
+        // 「没检索到」还是「检索到了但模型没用对」，两者的修法完全不同。
+        trace.setRagHitCount(chunks.size());
+        trace.setRagTitles(chunks.stream()
+                .map(KnowledgeRetriever.RetrievedChunk::getTitle)
+                .reduce((a, b) -> a + " | " + b).orElse(""));
 
         // 落盘（失败不影响请求）
         traceRecorder.record(trace);

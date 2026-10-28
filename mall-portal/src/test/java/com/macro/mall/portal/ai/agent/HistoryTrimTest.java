@@ -66,6 +66,56 @@ class HistoryTrimTest {
         return (Integer) method.invoke(c, m);
     }
 
+    // ==================================================================
+    // 意图路由：查数据 vs 查政策（真机验证发现的误命中问题）
+    // ==================================================================
+
+    @Test
+    @DisplayName("「查我的订单」类问题必须判定为数据查询，不走知识库")
+    void dataQuery_detectsPersonalData() throws Exception {
+        AiAgentController c = newController(20, 100000, 6000);
+        java.lang.reflect.Method m = AiAgentController.class.getDeclaredMethod("isDataQuery", String.class);
+        m.setAccessible(true);
+
+        // 这些都是在问「我的数据」，不该去检索客服政策
+        // 真机实测：「我有几个订单」与知识块「订单取消」相似度 0.61，会误命中
+        String[] dataQueries = {
+                "我有几个订单？",
+                "我的订单到哪了？",
+                "帮我查订单",
+                "我买了什么",
+                "最近买的手机多少钱",
+                "订单 202610200101000001 的详情",
+                "我的购物车有什么",
+                "物流信息"
+        };
+        for (String q : dataQueries) {
+            assertEquals(Boolean.TRUE, m.invoke(c, q), "应判定为数据查询: " + q);
+        }
+    }
+
+    @Test
+    @DisplayName("「问政策规则」类问题必须判定为非数据查询，走知识库")
+    void policyQuery_notDataQuery() throws Exception {
+        AiAgentController c = newController(20, 100000, 6000);
+        java.lang.reflect.Method m = AiAgentController.class.getDeclaredMethod("isDataQuery", String.class);
+        m.setAccessible(true);
+
+        String[] policyQueries = {
+                "能退货吗？",
+                "退货运费谁出？",
+                "优惠券能叠加吗？",
+                "发票怎么开？",
+                "积分怎么获得？",
+                "多久发货？",
+                "会员有什么权益？",
+                "客服几点下班？"
+        };
+        for (String q : policyQueries) {
+            assertEquals(Boolean.FALSE, m.invoke(c, q), "应判定为政策查询（非数据查询）: " + q);
+        }
+    }
+
     @Test
     @DisplayName("未超限时不裁剪")
     void noTrimWhenWithinLimits() throws Exception {

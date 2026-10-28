@@ -95,6 +95,10 @@ spring:
         embedding-dimension: ${EMBEDDING_DIM:1024}
         index-type: HNSW
         metric-type: COSINE
+        # ★ 必须为 true：否则 Milvus 里的 collection 不会被自动创建，
+        #   写入时会报 can't find collection[mall_knowledge]（实测踩过）。
+        #   默认是 false，需要显式打开。
+        initialize-schema: true
 
 # 没配模型时，把 ChatClient 自动配置一并排除（否则它会因缺 ChatModel 而让请求 500/401）。
 # 配了模型时这一行不起作用 —— 由下面的 SpEL 判断决定。

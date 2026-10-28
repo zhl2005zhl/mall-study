@@ -275,7 +275,7 @@ public class AiAgentController {
         // 而不是拿到一堆无关内容硬编 —— 这就是 similarityThreshold 的意义。
         String knowledgeContext = "";
         List<com.macro.mall.portal.ai.rag.KnowledgeRetriever.RetrievedChunk> chunks = new ArrayList<>();
-        if (knowledgeRetriever != null) {
+        if (knowledgeRetriever != null && !isDataQuery(question)) {
             chunks = knowledgeRetriever.retrieve(question);
             knowledgeContext = knowledgeRetriever.buildContext(chunks);
         }
@@ -473,6 +473,9 @@ public class AiAgentController {
         result.setCompletionTokens(trace.getCompletionTokens());
         result.setHistoryTrimCount(historyTrimCount);
         result.setTraceId(trace.getTraceId());
+        // 把 RAG 命中情况一并返回：调用方不必翻 trace 文件就能判断检索质量
+        result.setRagHitCount(trace.getRagHitCount());
+        result.setRagTitles(trace.getRagTitles());
 
         LOGGER.info("[AI Agent] 完成 traceId={} sessionId={} 轮次={} 工具调用={} "
                         + "token={}(prompt={}/completion={}) 耗时={}ms 裁剪={}次 终止原因={}",
@@ -482,6 +485,50 @@ public class AiAgentController {
         return result;
     }
 
+    /**
+     * 判断这是不是「查我的数据」类问题（订单/购物车/地址等个人数据）。
+     *
+     * ============================ 为什么需要这个判断 ============================
+     * 真机验证踩到的坑，而且很反直觉：
+     *
+     *   「我有几个订单？」  →  与知识块「订单取消」相似度 **0.61**（> 阈值 0.5，误命中）
+     *   「优惠券能叠加吗？」→  与订单政策相似度   **0.47**（< 阈值，正确不命中）
+     *
+     * 也就是说：**问「我的订单」比问「优惠券政策」更容易命中订单类知识块**。
+     * 根因是「订单」这个词的语义锚定太强 —— 两个句子都含「订单」，
+     * 向量相似度天然偏高。这是 RAG 的经典陷阱：**词面相似 ≠ 意图相关**。
+     *
+     * 光调阈值解决不了：要滤掉 0.61 就得把阈值提到 0.62，
+     * 但那会连带把真正相关的政策问答也挡掉。
+     *
+     * 所以改成**意图路由**：查个人数据的走工具，查政策规则的才走知识库。
+     * 这也符合业务直觉 —— 用户问「我有几个订单」时，他要的是自己的订单列表，
+     * 不是「订单取消政策」。
+     *
+     * 用关键词而非模型判断：这里要的是**确定性**和**零成本**。
+     * 多调一次模型来做意图分类，既增加延迟又引入不确定性；
+     * 而「我的/我有/几笔/多少钱」这类词很稳定，误判代价也小
+     * （最坏情况是该查政策时没查，模型会直说不知道，不会编）。
+     */
+    private boolean isDataQuery(String question) {
+        if (question == null || question.isEmpty()) {
+            return false;
+        }
+        String q = question.trim();
+        // 第一人称 + 数据量词：几乎必然是在问「我的数据」
+        String[] dataPatterns = {
+                "我的订单", "我有", "我买", "我的购物车", "我的地址", "我的收藏",
+                "几个订单", "几笔订单", "多少订单", "订单状态", "订单到哪", "物流",
+                "买了什么", "花了多少", "最近买", "查订单", "查一下订单", "订单号"
+        };
+        for (String p : dataPatterns) {
+            if (q.contains(p)) {
+                return true;
+            }
+        }
+        // 18 位纯数字：用户直接贴订单号，也是在查数据
+        return q.matches(".*\\b\\d{18}\\b.*");
+    }
     /** 当前使用的模型名（构造时注入，trace 里用来对比成本）。 */
     private String resolveModelName() {
         return modelName;
@@ -743,6 +790,10 @@ public class AiAgentController {
         private Integer historyTrimCount;
         /** trace id，可与落盘的 JSONL 对应。 */
         private String traceId;
+        /** RAG 检索命中的知识块数量（RAG 未启用或未命中时为 0）。 */
+        private Integer ragHitCount;
+        /** 命中的知识块标题，便于核查「检索得对不对」。 */
+        private String ragTitles;
 
         public String getAnswer() { return answer; }
         public void setAnswer(String answer) { this.answer = answer; }
@@ -768,6 +819,10 @@ public class AiAgentController {
         public void setHistoryTrimCount(Integer historyTrimCount) { this.historyTrimCount = historyTrimCount; }
         public String getTraceId() { return traceId; }
         public void setTraceId(String traceId) { this.traceId = traceId; }
+        public Integer getRagHitCount() { return ragHitCount; }
+        public void setRagHitCount(Integer ragHitCount) { this.ragHitCount = ragHitCount; }
+        public String getRagTitles() { return ragTitles; }
+        public void setRagTitles(String ragTitles) { this.ragTitles = ragTitles; }
     }
 
     // 单轮记录统一使用 AgentTrace.Step（见 ai/domain/AgentTrace.java），

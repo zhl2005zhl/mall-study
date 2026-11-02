@@ -50,6 +50,28 @@ mvn compile -pl mall-portal '-DskipTests=true'
 4. **金额比较一律 `compareTo`**，禁止 `BigDecimal.intValue()`（向零截断，(−1,0) 会变 0）。
 5. 批量接口必须有**单批上限**，长任务必须**分批 + 每批独立事务**。
 
+## AI 模块（`mall-portal/.../portal/ai/`）
+
+**动这块代码前必读 `docs/ai/README.md`**。16 个文件 / 3211 行 + 40 项单测，几条硬约束：
+
+1. **工具签名里绝不放身份参数**。身份一律 `memberService.getCurrentMember()` 从 SecurityContext 取。
+   「模型能传的身份 = 用户能伪造的身份」，放 `memberId` 就是水平越权（Controller 鉴权挡不住）。
+   有单测钉住：`McpProductToolsTest.noIdentityParameters`。
+2. **MCP 只暴露公开数据**（`McpProductTools` 的 2 个商品工具）。
+   订单工具在 `MallTools`，**不通过 MCP 暴露**——外部调用没有 SecurityContext，
+   要查订单只能让调用方传 `memberId`，等于把口子重新打开。有单测钉住工具清单。
+3. **Agent 循环用 `internalToolExecutionEnabled(false)`**。
+   不关掉的话 Spring AI 会自己执行工具，`getToolCalls()` 永远空，手写循环等于没跑
+   （表面 Answer 正常，实际框架代劳了）。
+4. **拿 SecurityContext 的异步任务必须用 `DelegatingSecurityContextExecutorService`**。
+   ThreadLocal 不跨线程，否则工具全集 NPE，且表现为「模型说系统有点小故障」——看似正常降级。
+5. **RAG 检索前先 `isDataQuery()` 意图路由**。查个人数据的不走知识库：
+   实测「我有几个订单」与知识块「订单取消」相似度 0.61 会误命中，而调阈值会顾此失彼。
+
+启动 AI 能力需要三个环境变量：`AI_CHAT_PROVIDER=deepseek` + `RAG_ENABLED=true` + `MCP_AUTH_TOKEN`。
+**不配也能正常启动**（`AiAgentFallbackController` 接管 `/ai/**` 返回友好提示），
+RAG/Ollama/Milvus 全挂时也只降级不影响主业务。
+
 ## 已知坑
 
 1. **`mall-admin` 新增后台接口必须做三件事**（缺一永远 403）：
@@ -58,9 +80,14 @@ mvn compile -pl mall-portal '-DskipTests=true'
 2. **后台跑的应用会被回收** → 判断存活看**端口监听 + 日志是否推进**，不要只看进程。
 3. **代理端口会变**：先 `netstat -ano | grep LISTENING | grep "127.0.0.1:789"` 看实际端口，
    用 `git -c http.proxy=http://127.0.0.1:<port> -c https.proxy=... push` 临时覆盖；**不要改全局配置**。
+   代理全关时直连可能反而可用：`git -c http.proxy= -c https.proxy= push`。
 4. **HTML 文档有意不入库**（见 `.gitignore`），仓库只跟踪代码、`docs/` 的 lab 脚本与 .md。
+5. **Spring AI 版本锁 1.1.0，不要升 2.0.0**：2.0 依赖 Spring Boot 4.1，与本项目 3.5.14 冲突。
+6. **Ollama 要用 PowerShell 启动**：`bash` 里 `ollama serve` 会 `panic: %userprofile% is not defined`。
+7. **后台进程会随 shell 会话结束被带走**：用 `cmd /c start` 或 `Start-Process` 脱离，否则服务莫名消失（日志无异常）。
 
 ## 详细资料
 
 - 仓库内：`docs/`（技术文档 .md + `lab/` 复现与压测脚本）
+- **AI 能力详设：`docs/ai/README.md`**（架构 / 设计取舍 / 真机验证数据 / 40 项测试 / 启动步骤）
 - 个人长期记忆与资料库：见 `AGENTS.local.md`（本机路径，不提交）
